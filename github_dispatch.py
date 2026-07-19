@@ -28,7 +28,15 @@ def push_srt_to_gist(srt_path: str, chat_id) -> str | None:
             "files": {f"{chat_id}_subs.srt": {"content": content}},
         }
         resp = requests.post(f"{GITHUB_API}/gists", headers=_headers(), json=payload, timeout=30)
+        if resp.status_code != 201:
+            log.error("Gist creation failed (%s): %s", resp.status_code, resp.text)
         resp.raise_for_status()
+        data = resp.json()
+        filename = next(iter(data["files"]))
+        return data["files"][filename]["raw_url"]
+    except Exception:
+        log.exception("Failed to push SRT to Gist")
+        return None
         data = resp.json()
         filename = next(iter(data["files"]))
         return data["files"][filename]["raw_url"]

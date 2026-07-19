@@ -1,0 +1,7 @@
+.env
+service_account.json
+sa.json
+subs/
+__pycache__/
+*.pyc
+bot.log

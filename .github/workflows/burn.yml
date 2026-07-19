@@ -1,0 +1,108 @@
+name: Burn Subtitles
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Direct/Pixeldrain video URL"
+        required: true
+        type: string
+      srt_url:
+        description: "Raw URL to the .srt file (gist)"
+        required: true
+        type: string
+      sub_type:
+        description: "english or sinhala"
+        required: true
+        type: string
+      chat_id:
+        description: "Telegram chat_id to notify when done"
+        required: true
+        type: string
+
+jobs:
+  burn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repo (for scripts)
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg + Sinhala font
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg fonts-noto-core
+
+      - name: Set up Python deps
+        run: |
+          pip install --quiet google-generativeai google-api-python-client google-auth requests
+
+      - name: Download SRT
+        run: curl -L -o subs_raw.srt "${{ inputs.srt_url }}"
+
+      - name: Translate to Sinhala (only if needed)
+        if: inputs.sub_type == 'english'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python scripts/translate.py subs_raw.srt subs.srt
+
+      - name: Use subtitles as-is (already Sinhala)
+        if: inputs.sub_type != 'english'
+        run: cp subs_raw.srt subs.srt
+
+      - name: Download video
+        run: |
+          set -e
+          URL="${{ inputs.video_url }}"
+          if echo "$URL" | grep -q "pixeldrain.com/u/"; then
+            FILE_ID=$(echo "$URL" | sed -E 's#.*pixeldrain\.com/u/([a-zA-Z0-9]+).*#\1#')
+            URL="https://pixeldrain.com/api/file/${FILE_ID}"
+          fi
+          curl -L -A "Mozilla/5.0" -e "https://pixeldrain.com/" -o input_video.mp4 "$URL"
+          ls -lh input_video.mp4
+
+      - name: Burn subtitles (CineSubz-style)
+        run: |
+          set -e
+          ffmpeg -y -i input_video.mp4 \
+            -vf "subtitles=subs.srt:fontsdir=/usr/share/fonts/truetype/noto:force_style='FontName=Noto Sans Sinhala,Bold=1,FontSize=26,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,BorderStyle=1,Outline=1.6,Shadow=0.8,Alignment=2,MarginV=40'" \
+            -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p \
+            -c:a aac -b:a 160k \
+            -movflags +faststart \
+            output_final.mp4
+          ls -lh output_final.mp4
+
+      - name: Upload to Google Drive
+        id: drive
+        env:
+          GDRIVE_SA_JSON_B64: ${{ secrets.GDRIVE_SA_JSON_B64 }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          set -e
+          echo "$GDRIVE_SA_JSON_B64" | base64 -d > sa.json
+          GDRIVE_SA_JSON=sa.json python scripts/upload_drive.py output_final.mp4
+          echo "link=$(cat drive_link.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Notify on Telegram
+        if: always()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ inputs.chat_id }}
+          DRIVE_LINK: ${{ steps.drive.outputs.link }}
+        run: |
+          if [ -n "$DRIVE_LINK" ]; then
+            TEXT="🎉 Done! Your video: ${DRIVE_LINK}"
+          else
+            TEXT="❌ Something went wrong. Check the GitHub Actions log."
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            --data-urlencode text="${TEXT}"
+
+      - name: Upload artifact (backup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: burned-video
+          path: output_final.mp4
+          retention-days: 3

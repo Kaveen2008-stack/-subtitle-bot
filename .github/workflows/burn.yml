@@ -28,14 +28,21 @@ jobs:
       - name: Checkout repo (for scripts)
         uses: actions/checkout@v4
 
-      - name: Install ffmpeg (Ubuntu package - correct HarfBuzz shaping for Sinhala) + Sinhala font
+     - name: Install ffmpeg + latest Noto Sans Sinhala font
         run: |
           set -e
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg fonts-noto-core
+          sudo apt-get install -y ffmpeg
+          mkdir -p sinhala-font
+          curl -L -o sinhala-font/NotoSansSinhala-Regular.ttf \
+            "https://github.com/notofonts/notofonts.github.io/raw/main/fonts/NotoSansSinhala/hinted/ttf/NotoSansSinhala-Regular.ttf"
+          curl -L -o sinhala-font/NotoSansSinhala-Bold.ttf \
+            "https://github.com/notofonts/notofonts.github.io/raw/main/fonts/NotoSansSinhala/hinted/ttf/NotoSansSinhala-Bold.ttf"
+          sudo mkdir -p /usr/share/fonts/truetype/noto-latest
+          sudo cp sinhala-font/*.ttf /usr/share/fonts/truetype/noto-latest/
           fc-cache -f
           ffmpeg -version
-
+          
       - name: Set up Python deps
         run: |
           pip install --quiet google-generativeai google-api-python-client google-auth requests

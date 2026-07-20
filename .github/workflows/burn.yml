@@ -71,17 +71,17 @@ jobs:
           curl -L -A "Mozilla/5.0" -e "https://pixeldrain.com/" -o input_video.mp4 "$URL"
           ls -lh input_video.mp4
 
-      - name: Burn subtitles (CineSubz-style)
+     - name: Burn subtitles (CineSubz-style)
         run: |
           set -e
           ffmpeg -y -i input_video.mp4 \
-            -vf "subtitles=subs.srt:fontsdir=/usr/share/fonts/truetype/noto:force_style='FontName=Noto Sans Sinhala,Bold=1,FontSize=15,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,BorderStyle=1,Outline=1.4,Shadow=0.7,Alignment=2,MarginV=35'" \
+            -vf "subtitles=subs.srt:fontsdir=/usr/share/fonts/truetype/noto-latest:force_style='FontName=Noto Sans Sinhala,FontSize=15,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,BorderStyle=1,Outline=1.4,Shadow=0.7,Alignment=2,MarginV=35'" \
             -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p \
             -c:a aac -b:a 160k \
             -movflags +faststart \
             output_final.mp4
           ls -lh output_final.mp4
-
+          
       - name: Upload to Google Drive
         id: drive
         env:

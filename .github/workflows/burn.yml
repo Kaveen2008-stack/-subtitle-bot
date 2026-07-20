@@ -71,17 +71,13 @@ jobs:
           curl -L -A "Mozilla/5.0" -e "https://pixeldrain.com/" -o input_video.mp4 "$URL"
           ls -lh input_video.mp4
 
-     - name: Burn subtitles (CineSubz-style)
+     - name: Install ffmpeg (Ubuntu package - correct HarfBuzz shaping for Sinhala) + Sinhala font
         run: |
           set -e
-          ffmpeg -y -i input_video.mp4 \
-            -vf "subtitles=subs.srt:fontsdir=/usr/share/fonts/truetype/noto-latest:force_style='FontName=Noto Sans Sinhala,FontSize=15,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,BorderStyle=1,Outline=1.4,Shadow=0.7,Alignment=2,MarginV=35'" \
-            -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p \
-            -c:a aac -b:a 160k \
-            -movflags +faststart \
-            output_final.mp4
-          ls -lh output_final.mp4
-          
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg fonts-noto-core
+          fc-cache -f
+          ffmpeg -version
       - name: Upload to Google Drive
         id: drive
         env:

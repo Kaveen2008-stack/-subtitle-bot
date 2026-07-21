@@ -18,7 +18,6 @@ import sys
 
 from PIL import Image, ImageDraw, ImageFont, features
 
-
 def get_video_info(video_path):
     cmd = [
         "ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -26,7 +25,11 @@ def get_video_info(video_path):
         "-show_entries", "format=duration",
         "-of", "json", video_path,
     ]
-    out = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    out = subprocess.run(cmd, capture_output=True, text=True)
+    if out.returncode != 0:
+        print(f"ffprobe STDOUT: {out.stdout}", file=sys.stderr)
+        print(f"ffprobe STDERR: {out.stderr}", file=sys.stderr)
+        raise RuntimeError(f"ffprobe failed on {video_path} (exit {out.returncode})")
     data = json.loads(out.stdout)
     width = data["streams"][0]["width"]
     height = data["streams"][0]["height"]

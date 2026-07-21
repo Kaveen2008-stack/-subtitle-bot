@@ -32,9 +32,12 @@ jobs:
         run: |
           set -e
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg libraqm0 fonts-noto-core
+          sudo apt-get install -y ffmpeg libraqm0
           pip install --quiet --upgrade Pillow
           python3 -c "from PIL import features; assert features.check('raqm'), 'raqm NOT available'; print('raqm OK')"
+          mkdir -p sinhala-font
+          curl -L -o sinhala-font/AbhayaLibre-Bold.ttf \
+            "https://github.com/google/fonts/raw/main/ofl/abhayalibre/AbhayaLibre-Bold.ttf"
           ffmpeg -version
 
       - name: Set up Python deps
@@ -65,13 +68,10 @@ jobs:
           curl -L -A "Mozilla/5.0" -e "https://pixeldrain.com/" -o input_video.mp4 "$URL"
           ls -lh input_video.mp4
 
-      - name: Render subtitle overlay (Pillow + raqm - correct Sinhala shaping)
+     - name: Render subtitle overlay (Pillow + raqm - correct Sinhala shaping)
         run: |
           set -e
-          FONT_PATH=$(fc-match "Noto Sans Sinhala" --format=%{file})
-          echo "Using font: $FONT_PATH"
-          python scripts/render_subtitles_overlay.py input_video.mp4 subs.srt overlay.mov "$FONT_PATH"
-
+          python scripts/render_subtitles_overlay.py input_video.mp4 subs.srt overlay.mov "sinhala-font/AbhayaLibre-Bold.ttf"
       - name: Composite overlay onto video
         run: |
           set -e

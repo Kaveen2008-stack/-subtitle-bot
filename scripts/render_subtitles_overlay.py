@@ -92,7 +92,7 @@ def main():
     width, height, duration = get_video_info(video_path)
     cues = parse_srt(srt_path)
 
-    font_size = max(16, int(height * 0.032))
+    font_size = max(16, int(height * 0.045))
     margin_bottom = int(height * 0.06)
     font = make_font(font_path, font_size)
 

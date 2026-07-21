@@ -68,10 +68,11 @@ jobs:
           curl -L -A "Mozilla/5.0" -e "https://pixeldrain.com/" -o input_video.mp4 "$URL"
           ls -lh input_video.mp4
 
-     - name: Render subtitle overlay (Pillow + raqm - correct Sinhala shaping)
+      - name: Render subtitle overlay (Pillow + raqm - correct Sinhala shaping)
         run: |
           set -e
           python scripts/render_subtitles_overlay.py input_video.mp4 subs.srt overlay.mov "sinhala-font/AbhayaLibre-Bold.ttf"
+
       - name: Composite overlay onto video
         run: |
           set -e

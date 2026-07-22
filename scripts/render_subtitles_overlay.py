@@ -93,6 +93,7 @@ def main():
               file=sys.stderr)
 
     width, height, duration = get_video_info(video_path)
+    print(f"Video resolution detected: {width}x{height}, duration: {duration:.1f}s")
     cues = parse_srt(srt_path)
 
     font_size = max(25, int(height * 0.071))

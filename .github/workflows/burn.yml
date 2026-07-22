@@ -65,8 +65,14 @@ jobs:
             FILE_ID=$(echo "$URL" | sed -E 's#.*pixeldrain\.com/u/([a-zA-Z0-9]+).*#\1#')
             URL="https://pixeldrain.com/api/file/${FILE_ID}"
           fi
-          curl -L -A "Mozilla/5.0" -e "https://pixeldrain.com/" -o input_video.mp4 "$URL"
+          curl -f -L -A "Mozilla/5.0" -e "https://pixeldrain.com/" -o input_video.mp4 "$URL"
           ls -lh input_video.mp4
+          file input_video.mp4
+          if ! file input_video.mp4 | grep -qE "MP4|Matroska|ISO Media|WebM"; then
+            echo "ERROR: downloaded file is not a valid video (link may be expired/invalid)"
+            head -c 500 input_video.mp4
+            exit 1
+          fi
 
       - name: Render subtitle overlay (Pillow + raqm - correct Sinhala shaping)
         run: |
@@ -87,6 +93,7 @@ jobs:
 
       - name: Upload to Google Drive
         id: drive
+        continue-on-error: true
         env:
           GDRIVE_SA_JSON_B64: ${{ secrets.GDRIVE_SA_JSON_B64 }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
@@ -96,17 +103,41 @@ jobs:
           GDRIVE_SA_JSON=sa.json python scripts/upload_drive.py output_final.mp4
           echo "link=$(cat drive_link.txt)" >> "$GITHUB_OUTPUT"
 
+      - name: Upload to Abyss.to
+        id: abyss
+        continue-on-error: true
+        env:
+          ABYSS_API_KEY: ${{ secrets.ABYSS_API_KEY }}
+        run: |
+          set -e
+          python scripts/upload_abyss.py output_final.mp4
+          echo "link=$(cat abyss_link.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to Pixeldrain
+        id: pixeldrain
+        continue-on-error: true
+        env:
+          PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+        run: |
+          set -e
+          python scripts/upload_pixeldrain.py output_final.mp4
+          echo "link=$(cat pixeldrain_link.txt)" >> "$GITHUB_OUTPUT"
+
       - name: Notify on Telegram
         if: always()
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ inputs.chat_id }}
           DRIVE_LINK: ${{ steps.drive.outputs.link }}
+          ABYSS_LINK: ${{ steps.abyss.outputs.link }}
+          PIXELDRAIN_LINK: ${{ steps.pixeldrain.outputs.link }}
         run: |
-          if [ -n "$DRIVE_LINK" ]; then
-            TEXT="🎉 Done! Your video: ${DRIVE_LINK}"
-          else
-            TEXT="❌ Something went wrong. Check the GitHub Actions log."
+          TEXT="🎉 Done!"$'\n'
+          if [ -n "$DRIVE_LINK" ]; then TEXT="${TEXT}"$'\n'"📁 Drive: ${DRIVE_LINK}"; fi
+          if [ -n "$ABYSS_LINK" ]; then TEXT="${TEXT}"$'\n'"▶️ Abyss: ${ABYSS_LINK}"; fi
+          if [ -n "$PIXELDRAIN_LINK" ]; then TEXT="${TEXT}"$'\n'"📥 Pixeldrain: ${PIXELDRAIN_LINK}"; fi
+          if [ -z "$DRIVE_LINK" ] && [ -z "$ABYSS_LINK" ] && [ -z "$PIXELDRAIN_LINK" ]; then
+            TEXT="❌ All uploads failed. Check the GitHub Actions log."
           fi
           curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             -d chat_id="${CHAT_ID}" \

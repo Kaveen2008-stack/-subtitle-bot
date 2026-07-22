@@ -98,8 +98,14 @@ def handle_video_link(message):
 
 def main():
     log.info("Bot starting (polling)...")
-    bot.infinity_polling()
-
+    while True:
+        try:
+            bot.infinity_polling(timeout=30, long_polling_timeout=30)
+        except Exception:
+            log.exception("Polling crashed, restarting in 5s...")
+            import time
+            time.sleep(5)
+            
 
 if __name__ == "__main__":
     main()

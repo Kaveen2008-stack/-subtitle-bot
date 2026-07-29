@@ -36,8 +36,8 @@ jobs:
           pip install --quiet --upgrade Pillow
           python3 -c "from PIL import features; assert features.check('raqm'), 'raqm NOT available'; print('raqm OK')"
           mkdir -p sinhala-font
-          curl -L -o sinhala-font/AbhayaLibre-Bold.ttf \
-            "https://github.com/google/fonts/raw/main/ofl/abhayalibre/AbhayaLibre-Bold.ttf"
+          curl -L -o sinhala-font/NotoSansSinhala-Bold.ttf \
+            "https://github.com/notofonts/notofonts.github.io/raw/main/fonts/NotoSansSinhala/hinted/ttf/NotoSansSinhala-Bold.ttf"
           ffmpeg -version
 
       - name: Set up Python deps
@@ -77,7 +77,7 @@ jobs:
       - name: Render subtitle overlay (Pillow + raqm - correct Sinhala shaping)
         run: |
           set -e
-          python scripts/render_subtitles_overlay.py input_video.mp4 subs.srt overlay.mov "sinhala-font/AbhayaLibre-Bold.ttf"
+          python scripts/render_subtitles_overlay.py input_video.mp4 subs.srt overlay.mov "sinhala-font/NotoSansSinhala.ttf"
 
       - name: Composite overlay onto video
         run: |

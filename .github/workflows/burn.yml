@@ -28,7 +28,7 @@ jobs:
       - name: Checkout repo (for scripts)
         uses: actions/checkout@v4
 
-    - name: Install ffmpeg, libraqm, Pillow, and Sinhala font
+      - name: Install ffmpeg, libraqm, Pillow, and Sinhala font
         run: |
           set -e
           sudo apt-get update -qq
@@ -83,6 +83,7 @@ jobs:
           set -e
           echo "Using font: $SINHALA_FONT_PATH"
           python scripts/render_subtitles_overlay.py input_video.mp4 subs.srt overlay.mov "$SINHALA_FONT_PATH"
+
       - name: Composite overlay onto video
         run: |
           set -e
@@ -110,16 +111,6 @@ jobs:
           GDRIVE_SA_JSON=sa.json python scripts/upload_drive.py output_final.mp4
           echo "link=$(cat drive_link.txt)" >> "$GITHUB_OUTPUT"
 
-      - name: Upload to Abyss.to
-        id: abyss
-        continue-on-error: true
-        env:
-          ABYSS_API_KEY: ${{ secrets.ABYSS_API_KEY }}
-        run: |
-          set -e
-          python scripts/upload_abyss.py output_final.mp4
-          echo "link=$(cat abyss_link.txt)" >> "$GITHUB_OUTPUT"
-
       - name: Upload to Pixeldrain
         id: pixeldrain
         continue-on-error: true
@@ -136,14 +127,12 @@ jobs:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ inputs.chat_id }}
           DRIVE_LINK: ${{ steps.drive.outputs.link }}
-          ABYSS_LINK: ${{ steps.abyss.outputs.link }}
           PIXELDRAIN_LINK: ${{ steps.pixeldrain.outputs.link }}
         run: |
           TEXT="🎉 Done!"$'\n'
           if [ -n "$DRIVE_LINK" ]; then TEXT="${TEXT}"$'\n'"📁 Drive: ${DRIVE_LINK}"; fi
-          if [ -n "$ABYSS_LINK" ]; then TEXT="${TEXT}"$'\n'"▶️ Abyss: ${ABYSS_LINK}"; fi
           if [ -n "$PIXELDRAIN_LINK" ]; then TEXT="${TEXT}"$'\n'"📥 Pixeldrain: ${PIXELDRAIN_LINK}"; fi
-          if [ -z "$DRIVE_LINK" ] && [ -z "$ABYSS_LINK" ] && [ -z "$PIXELDRAIN_LINK" ]; then
+          if [ -z "$DRIVE_LINK" ] && [ -z "$PIXELDRAIN_LINK" ]; then
             TEXT="❌ All uploads failed. Check the GitHub Actions log."
           fi
           curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \

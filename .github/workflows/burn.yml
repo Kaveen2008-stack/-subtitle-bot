@@ -28,16 +28,20 @@ jobs:
       - name: Checkout repo (for scripts)
         uses: actions/checkout@v4
 
-      - name: Install ffmpeg, libraqm, Pillow, and Sinhala font
+    - name: Install ffmpeg, libraqm, Pillow, and Sinhala font
         run: |
           set -e
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg libraqm0
+          sudo apt-get install -y ffmpeg libraqm0 fonts-noto-core
           pip install --quiet --upgrade Pillow
           python3 -c "from PIL import features; assert features.check('raqm'), 'raqm NOT available'; print('raqm OK')"
-          mkdir -p sinhala-font
-          curl -L -o sinhala-font/NotoSansSinhala-Bold.ttf \
-            "https://github.com/notofonts/notofonts.github.io/raw/main/fonts/NotoSansSinhala/hinted/ttf/NotoSansSinhala-Bold.ttf"
+          FONT_PATH=$(fc-match "Noto Sans Sinhala" --format=%{file})
+          echo "SINHALA_FONT_PATH=$FONT_PATH" >> "$GITHUB_ENV"
+          echo "Font resolved to: $FONT_PATH"
+          if [ ! -f "$FONT_PATH" ]; then
+            echo "ERROR: Sinhala font file not found at $FONT_PATH"
+            exit 1
+          fi
           ffmpeg -version
 
       - name: Set up Python deps
@@ -77,8 +81,8 @@ jobs:
       - name: Render subtitle overlay (Pillow + raqm - correct Sinhala shaping)
         run: |
           set -e
-          python scripts/render_subtitles_overlay.py input_video.mp4 subs.srt overlay.mov "sinhala-font/NotoSansSinhala.ttf"
-
+          echo "Using font: $SINHALA_FONT_PATH"
+          python scripts/render_subtitles_overlay.py input_video.mp4 subs.srt overlay.mov "$SINHALA_FONT_PATH"
       - name: Composite overlay onto video
         run: |
           set -e

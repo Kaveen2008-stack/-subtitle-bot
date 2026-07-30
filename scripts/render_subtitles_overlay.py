@@ -96,8 +96,8 @@ def main():
     print(f"Video resolution detected: {width}x{height}, duration: {duration:.1f}s")
     cues = parse_srt(srt_path)
 
-    font_size = max(25, int(height * 0.071))
-    margin_bottom = int(height * 0.10)
+    font_size = 25
+    margin_bottom = 90
     font = make_font(font_path, font_size)
 
     blank = Image.new("RGBA", (width, height), (0, 0, 0, 0))

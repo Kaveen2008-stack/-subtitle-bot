@@ -35,15 +35,16 @@ jobs:
           sudo apt-get install -y ffmpeg libraqm0 fonts-noto-core
           pip install --quiet --upgrade Pillow
           python3 -c "from PIL import features; assert features.check('raqm'), 'raqm NOT available'; print('raqm OK')"
-          FONT_PATH=$(fc-match "Noto Sans Sinhala" --format=%{file})
-          echo "SINHALA_FONT_PATH=$FONT_PATH" >> "$GITHUB_ENV"
-          echo "Font resolved to: $FONT_PATH"
-          if [ ! -f "$FONT_PATH" ]; then
-            echo "ERROR: Sinhala font file not found at $FONT_PATH"
+          mkdir -p sinhala-font
+          curl -f -L -o sinhala-font/AbhayaLibre-Bold.ttf \
+            "https://github.com/google/fonts/raw/main/ofl/abhayalibre/AbhayaLibre-Bold.ttf"
+          if ! file sinhala-font/AbhayaLibre-Bold.ttf | grep -q "TrueType"; then
+            echo "ERROR: Font download failed or file is not a valid TTF"
             exit 1
           fi
-          ffmpeg -version
-
+          echo "SINHALA_FONT_PATH=sinhala-font/AbhayaLibre-Bold.ttf" >> "$GITHUB_ENV"
+          echo "Font resolved to: sinhala-font/AbhayaLibre-Bold.ttf"
+          
       - name: Set up Python deps
         run: |
           pip install --quiet google-generativeai google-api-python-client google-auth requests

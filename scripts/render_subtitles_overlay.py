@@ -97,7 +97,7 @@ def main():
     cues = parse_srt(srt_path)
 
     font_size = 38
-    margin_bottom = 80
+    margin_bottom = 50
     font = make_font(font_path, font_size)
 
     blank = Image.new("RGBA", (width, height), (0, 0, 0, 0))

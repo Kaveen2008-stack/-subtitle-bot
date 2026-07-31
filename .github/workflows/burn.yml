@@ -1,5 +1,4 @@
 name: Burn Subtitles
-
 on:
   workflow_dispatch:
     inputs:
@@ -19,7 +18,18 @@ on:
         description: "Telegram chat_id to notify when done"
         required: true
         type: string
-
+      tmdb_id:
+        description: "TMDB show ID"
+        required: true
+        type: string
+      season_number:
+        description: "Season number"
+        required: true
+        type: string
+      episode_number:
+        description: "Episode number"
+        required: true
+        type: string
 jobs:
   burn:
     runs-on: ubuntu-latest
@@ -121,6 +131,62 @@ jobs:
           set -e
           python scripts/upload_pixeldrain.py output_final.mp4
           echo "link=$(cat pixeldrain_link.txt)" >> "$GITHUB_OUTPUT"
+
+
+          - name: Upload to VOE.sx
+        id: voe
+        continue-on-error: true
+        env:
+          VOE_API_KEY: ${{ secrets.VOE_API_KEY }}
+        run: |
+          set -e
+          PIXELDRAIN_LINK="${{ steps.pixeldrain.outputs.link }}"
+          
+          # Start remote upload on VOE using the fresh Pixeldrain link
+          RESPONSE=$(curl -s "https://voe.sx/api/upload/url?key=${VOE_API_KEY}&url=${PIXELDRAIN_LINK}")
+          echo "VOE upload response: $RESPONSE"
+          
+          QUEUE_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['queueID'])")
+          echo "VOE queueID: $QUEUE_ID"
+          
+          # Poll status until ready (max ~15 minutes)
+          for i in $(seq 1 90); do
+            sleep 10
+            STATUS=$(curl -s "https://voe.sx/api/upload/url/list?key=${VOE_API_KEY}&id=${QUEUE_ID}")
+            PERCENT=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['list']['data'][0].get('percent', 0))" 2>/dev/null || echo "0")
+            FILE_CODE=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['list']['data'][0].get('file_code', ''))" 2>/dev/null || echo "")
+            echo "Attempt $i: percent=$PERCENT"
+            if [ "$PERCENT" = "100" ]; then
+              echo "link=https://voe.sx/e/${FILE_CODE}" >> "$GITHUB_OUTPUT"
+              echo "VOE embed link ready: https://voe.sx/e/${FILE_CODE}"
+              exit 0
+            fi
+          done
+          echo "VOE processing timed out"
+          exit 1
+
+
+
+          - name: Notify website (webhook)
+        if: always()
+        continue-on-error: true
+        env:
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          PIXELDRAIN_LINK: ${{ steps.pixeldrain.outputs.link }}
+          VOE_LINK: ${{ steps.voe.outputs.link }}
+        run: |
+          curl -s -X POST "https://onlyksub.vercel.app/api/webhook-hardcode-complete" \
+            -H "Content-Type: application/json" \
+            -H "x-webhook-secret: ${WEBHOOK_SECRET}" \
+            -d "{
+              \"tmdb_id\": ${{ inputs.tmdb_id }},
+              \"season_number\": ${{ inputs.season_number }},
+              \"episode_number\": ${{ inputs.episode_number }},
+              \"pixeldrain_download_url\": \"${PIXELDRAIN_LINK}\",
+              \"voe_embed_url\": \"${VOE_LINK}\",
+              \"quality\": \"1080p\"
+            }"
+            
 
       - name: Notify on Telegram
         if: always()

@@ -54,7 +54,7 @@ jobs:
           fi
           echo "SINHALA_FONT_PATH=sinhala-font/AbhayaLibre-Bold.ttf" >> "$GITHUB_ENV"
           echo "Font resolved to: sinhala-font/AbhayaLibre-Bold.ttf"
-          
+
       - name: Set up Python deps
         run: |
           pip install --quiet google-generativeai google-api-python-client google-auth requests
@@ -132,8 +132,7 @@ jobs:
           python scripts/upload_pixeldrain.py output_final.mp4
           echo "link=$(cat pixeldrain_link.txt)" >> "$GITHUB_OUTPUT"
 
-
-          - name: Upload to VOE.sx
+      - name: Upload to VOE.sx
         id: voe
         continue-on-error: true
         env:
@@ -141,15 +140,10 @@ jobs:
         run: |
           set -e
           PIXELDRAIN_LINK="${{ steps.pixeldrain.outputs.link }}"
-          
-          # Start remote upload on VOE using the fresh Pixeldrain link
           RESPONSE=$(curl -s "https://voe.sx/api/upload/url?key=${VOE_API_KEY}&url=${PIXELDRAIN_LINK}")
           echo "VOE upload response: $RESPONSE"
-          
           QUEUE_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['queueID'])")
           echo "VOE queueID: $QUEUE_ID"
-          
-          # Poll status until ready (max ~15 minutes)
           for i in $(seq 1 90); do
             sleep 10
             STATUS=$(curl -s "https://voe.sx/api/upload/url/list?key=${VOE_API_KEY}&id=${QUEUE_ID}")
@@ -165,9 +159,7 @@ jobs:
           echo "VOE processing timed out"
           exit 1
 
-
-
-          - name: Notify website (webhook)
+      - name: Notify website (webhook)
         if: always()
         continue-on-error: true
         env:
@@ -186,7 +178,6 @@ jobs:
               \"voe_embed_url\": \"${VOE_LINK}\",
               \"quality\": \"1080p\"
             }"
-            
 
       - name: Notify on Telegram
         if: always()

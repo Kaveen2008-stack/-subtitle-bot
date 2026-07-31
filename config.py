@@ -15,5 +15,6 @@ TELEGRAM_BOT_TOKEN = _require("TELEGRAM_BOT_TOKEN")
 GITHUB_TOKEN = _require("GITHUB_TOKEN")          # needs repo + gist scopes
 GITHUB_REPO = _require("GITHUB_REPO")            # "owner/repo"
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
+TMDB_API_KEY = _require("TMDB_API_KEY")          # for drama name search
 
 MAX_SRT_MB = 2  # sanity limit for subtitle uploads

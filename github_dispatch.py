@@ -1,9 +1,9 @@
 """
 Everything needed to hand a job off to GitHub Actions:
   1. Push the raw SRT (untranslated is fine) to a secret Gist -> raw URL.
-  2. Dispatch burn.yml with video_url, srt_url, sub_type, chat_id.
-The workflow itself does translation (if needed), download, burn, Drive
-upload, and the Telegram "done" notification.
+  2. Dispatch burn.yml with video_url, srt_url, sub_type, chat_id, tmdb_id, season, episode.
+The workflow itself does translation (if needed), download, burn, VOE upload,
+website webhook callback, and the Telegram "done" notification.
 """
 import requests
 
@@ -37,15 +37,17 @@ def push_srt_to_gist(srt_path: str, chat_id) -> str | None:
     except Exception:
         log.exception("Failed to push SRT to Gist")
         return None
-        data = resp.json()
-        filename = next(iter(data["files"]))
-        return data["files"][filename]["raw_url"]
-    except Exception:
-        log.exception("Failed to push SRT to Gist")
-        return None
 
 
-def trigger_burn_workflow(video_url: str, srt_url: str, sub_type: str, chat_id) -> bool:
+def trigger_burn_workflow(
+    video_url: str,
+    srt_url: str,
+    sub_type: str,
+    chat_id,
+    tmdb_id,
+    season_number,
+    episode_number,
+) -> bool:
     try:
         url = f"{GITHUB_API}/repos/{config.GITHUB_REPO}/actions/workflows/burn.yml/dispatches"
         payload = {
@@ -55,6 +57,9 @@ def trigger_burn_workflow(video_url: str, srt_url: str, sub_type: str, chat_id) 
                 "srt_url": srt_url,
                 "sub_type": sub_type,
                 "chat_id": str(chat_id),
+                "tmdb_id": str(tmdb_id),
+                "season_number": str(season_number),
+                "episode_number": str(episode_number),
             },
         }
         resp = requests.post(url, headers=_headers(), json=payload, timeout=30)
@@ -67,10 +72,20 @@ def trigger_burn_workflow(video_url: str, srt_url: str, sub_type: str, chat_id) 
         return False
 
 
-def run_via_github_actions(srt_path: str, video_url: str, sub_type: str, chat_id) -> tuple[bool, str]:
+def run_via_github_actions(
+    srt_path: str,
+    video_url: str,
+    sub_type: str,
+    chat_id,
+    tmdb_id=None,
+    season_number=None,
+    episode_number=None,
+) -> tuple[bool, str]:
     srt_url = push_srt_to_gist(srt_path, chat_id)
     if not srt_url:
         return False, "❌ Couldn't upload the subtitle file. Try again."
-    if not trigger_burn_workflow(video_url, srt_url, sub_type, chat_id):
+    if not trigger_burn_workflow(
+        video_url, srt_url, sub_type, chat_id, tmdb_id, season_number, episode_number
+    ):
         return False, "❌ Couldn't start the job. Check the bot's GitHub token/repo config."
     return True, "⏳ Job started on GitHub Actions. I'll message you here once it's done."

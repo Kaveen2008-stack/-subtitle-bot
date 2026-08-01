@@ -1,0 +1,236 @@
+name: Burn Subtitles Batch (Season/Archive)
+
+on:
+  workflow_dispatch:
+    inputs:
+      archive_url:
+        description: "Pixeldrain archive URL (7z/zip) with all episode videos"
+        required: true
+        type: string
+      srt_urls:
+        description: "Comma-separated raw .srt URLs, in episode order (ep1,ep2,ep3...)"
+        required: true
+        type: string
+      sub_type:
+        description: "english or sinhala"
+        required: true
+        type: string
+      chat_id:
+        description: "Telegram chat_id to notify when done"
+        required: true
+        type: string
+      tmdb_id:
+        description: "TMDB show ID"
+        required: true
+        type: string
+      season_number:
+        description: "Season number"
+        required: true
+        type: string
+
+jobs:
+  burn_batch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout repo (for scripts)
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg, libraqm, Pillow, Sinhala font, p7zip
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg libraqm0 fonts-noto-core p7zip-full unzip
+          pip install --quiet --upgrade Pillow
+          python3 -c "from PIL import features; assert features.check('raqm'), 'raqm NOT available'; print('raqm OK')"
+          mkdir -p sinhala-font
+          curl -f -L -o sinhala-font/AbhayaLibre-Bold.ttf \
+            "https://github.com/google/fonts/raw/main/ofl/abhayalibre/AbhayaLibre-Bold.ttf"
+          echo "SINHALA_FONT_PATH=sinhala-font/AbhayaLibre-Bold.ttf" >> "$GITHUB_ENV"
+
+      - name: Set up Python deps
+        run: |
+          pip install --quiet google-generativeai google-api-python-client google-auth requests
+
+      - name: Download archive
+        run: |
+          set -e
+          URL="${{ inputs.archive_url }}"
+          if echo "$URL" | grep -q "pixeldrain.com/u/"; then
+            FILE_ID=$(echo "$URL" | sed -E 's#.*pixeldrain\.com/u/([a-zA-Z0-9]+).*#\1#')
+            URL="https://pixeldrain.com/api/file/${FILE_ID}"
+          fi
+          curl -f -L -A "Mozilla/5.0" -e "https://pixeldrain.com/" -o archive_file "$URL"
+          ls -lh archive_file
+          file archive_file
+
+      - name: Extract archive
+        run: |
+          set -e
+          mkdir -p extracted
+          FILE_TYPE=$(file -b archive_file)
+          echo "Detected type: $FILE_TYPE"
+          if echo "$FILE_TYPE" | grep -qi "7-zip"; then
+            7z x archive_file -oextracted -y
+          elif echo "$FILE_TYPE" | grep -qi "zip"; then
+            unzip -o archive_file -d extracted
+          else
+            echo "Trying 7z as fallback (handles most archive types)"
+            7z x archive_file -oextracted -y
+          fi
+          echo "--- Extracted files ---"
+          find extracted -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" -o -iname "*.webm" \)
+
+      - name: Discover episodes and build ordered list
+        id: discover
+        run: |
+          set -e
+          python3 << 'PYEOF'
+          import os, re, json
+
+          video_files = []
+          for root, dirs, files in os.walk("extracted"):
+              for f in files:
+                  if f.lower().endswith((".mp4", ".mkv", ".avi", ".webm")):
+                      video_files.append(os.path.join(root, f))
+
+          episodes = []
+          for path in video_files:
+              filename = os.path.basename(path)
+              match = re.search(r'[Ss]\d+[Ee](\d+)', filename)
+              if match:
+                  ep_num = int(match.group(1))
+                  episodes.append({"episode": ep_num, "path": path})
+
+          episodes.sort(key=lambda x: x["episode"])
+
+          print(f"Discovered {len(episodes)} episodes:")
+          for e in episodes:
+              print(f"  Episode {e['episode']}: {e['path']}")
+
+          with open("episodes_list.json", "w") as f:
+              json.dump(episodes, f)
+          PYEOF
+          cat episodes_list.json
+
+      - name: Process episodes sequentially (burn, upload, notify)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GDRIVE_SA_JSON_B64: ${{ secrets.GDRIVE_SA_JSON_B64 }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+          VOE_API_KEY: ${{ secrets.VOE_API_KEY }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ inputs.chat_id }}
+          TMDB_ID: ${{ inputs.tmdb_id }}
+          SEASON_NUMBER: ${{ inputs.season_number }}
+          SUB_TYPE: ${{ inputs.sub_type }}
+          SRT_URLS_RAW: ${{ inputs.srt_urls }}
+        run: |
+          set -e
+
+          IFS=',' read -ra SRT_ARRAY <<< "$SRT_URLS_RAW"
+
+          python3 << 'PYEOF' > episode_count.txt
+          import json
+          with open("episodes_list.json") as f:
+              episodes = json.load(f)
+          print(len(episodes))
+          PYEOF
+          EP_COUNT=$(cat episode_count.txt)
+          echo "Total episodes to process: $EP_COUNT"
+
+          for i in $(seq 0 $((EP_COUNT - 1))); do
+            EP_INFO=$(python3 -c "import json; d=json.load(open('episodes_list.json')); print(json.dumps(d[$i]))")
+            EP_NUM=$(echo "$EP_INFO" | python3 -c "import sys,json; print(json.load(sys.stdin)['episode'])")
+            EP_PATH=$(echo "$EP_INFO" | python3 -c "import sys,json; print(json.load(sys.stdin)['path'])")
+
+            echo "=================================================="
+            echo "Processing Episode $EP_NUM ($EP_PATH)"
+            echo "=================================================="
+
+            SRT_URL="${SRT_ARRAY[$i]}"
+            if [ -z "$SRT_URL" ]; then
+              echo "WARNING: No srt URL for episode $EP_NUM, skipping."
+              continue
+            fi
+
+            curl -L -o "subs_raw_ep${EP_NUM}.srt" "$SRT_URL"
+
+            if [ "$SUB_TYPE" == "english" ]; then
+              python scripts/translate.py "subs_raw_ep${EP_NUM}.srt" "subs_ep${EP_NUM}.srt"
+            else
+              cp "subs_raw_ep${EP_NUM}.srt" "subs_ep${EP_NUM}.srt"
+            fi
+
+            cp "$EP_PATH" "input_video_ep${EP_NUM}.mp4" || cp "$EP_PATH" "input_video_ep${EP_NUM}.mkv"
+            INPUT_FILE=$(ls input_video_ep${EP_NUM}.* | head -1)
+
+            python scripts/render_subtitles_overlay.py "$INPUT_FILE" "subs_ep${EP_NUM}.srt" "overlay_ep${EP_NUM}.mov" "$SINHALA_FONT_PATH"
+
+            WATERMARK_TEXT="OnlyKSub"
+            FILTER="[1:v]scale2ref=w=iw:h=ih[ov][base];[base][ov]overlay=0:0:format=auto[subbed];"
+            FILTER="${FILTER}[subbed]drawtext=text='${WATERMARK_TEXT}':fontfile=${SINHALA_FONT_PATH}:fontsize=16:fontcolor=white@0.6:borderw=1:bordercolor=black@0.5:x=w-tw-16:y=h-th-16[v]"
+
+            ffmpeg -y -i "$INPUT_FILE" -i "overlay_ep${EP_NUM}.mov" \
+              -filter_complex "$FILTER" \
+              -map "[v]" -map 0:a? \
+              -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p \
+              -c:a aac -b:a 160k \
+              -movflags +faststart \
+              "output_ep${EP_NUM}.mp4"
+
+            echo "Uploading Episode $EP_NUM to Pixeldrain..."
+            python scripts/upload_pixeldrain.py "output_ep${EP_NUM}.mp4"
+            PIXELDRAIN_LINK=$(cat pixeldrain_link.txt)
+            echo "Pixeldrain link: $PIXELDRAIN_LINK"
+
+            echo "Uploading Episode $EP_NUM to VOE.sx..."
+            RESPONSE=$(curl -s "https://voe.sx/api/upload/url?key=${VOE_API_KEY}&url=${PIXELDRAIN_LINK}")
+            QUEUE_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['queueID'])")
+
+            VOE_LINK=""
+            for attempt in $(seq 1 90); do
+              sleep 10
+              STATUS=$(curl -s "https://voe.sx/api/upload/url/list?key=${VOE_API_KEY}&id=${QUEUE_ID}")
+              PERCENT=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['list']['data'][0].get('percent', 0))" 2>/dev/null || echo "0")
+              FILE_CODE=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['list']['data'][0].get('file_code', ''))" 2>/dev/null || echo "")
+              if [ "$PERCENT" = "100" ]; then
+                VOE_LINK="https://voe.sx/e/${FILE_CODE}"
+                echo "VOE embed link ready: $VOE_LINK"
+                break
+              fi
+            done
+
+            echo "Notifying website for Episode $EP_NUM..."
+            curl -s -X POST "https://onlyksub.vercel.app/api/webhook-hardcode-complete" \
+              -H "Content-Type: application/json" \
+              -H "x-webhook-secret: ${WEBHOOK_SECRET}" \
+              -d "{
+                \"tmdb_id\": ${TMDB_ID},
+                \"season_number\": ${SEASON_NUMBER},
+                \"episode_number\": ${EP_NUM},
+                \"pixeldrain_download_url\": \"${PIXELDRAIN_LINK}\",
+                \"voe_embed_url\": \"${VOE_LINK}\",
+                \"quality\": \"1080p\"
+              }"
+
+            curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              -d chat_id="${CHAT_ID}" \
+              --data-urlencode text="✅ Episode ${EP_NUM} done! Pixeldrain: ${PIXELDRAIN_LINK}"
+
+            rm -f "input_video_ep${EP_NUM}".* "output_ep${EP_NUM}.mp4" "overlay_ep${EP_NUM}.mov"
+
+            echo "Episode $EP_NUM complete."
+          done
+
+      - name: Final notification
+        if: always()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ inputs.chat_id }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            --data-urlencode text="🎉 Batch processing complete for the whole season!"

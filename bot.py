@@ -19,14 +19,16 @@ user_sessions: dict[int, dict] = {}
 
 def _reset_session(chat_id: int) -> None:
     user_sessions[chat_id] = {
+        "mode": None,  # "single" or "batch"
         "tmdb_id": None,
         "drama_name": None,
         "season": None,
         "episode": None,
         "search_results": None,
         "srt_path": None,
+        "srt_paths": [],
         "sub_type": None,
-        "stage": "awaiting_drama_name",
+        "stage": "awaiting_mode",
     }
 
 
@@ -34,7 +36,31 @@ def _reset_session(chat_id: int) -> None:
 def send_welcome(message):
     chat_id = message.chat.id
     _reset_session(chat_id)
-    bot.reply_to(message, "👋 Welcome! Type the drama name to search (e.g. 'Agent Kim').")
+
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("1️⃣ Single Episode", callback_data="mode_single"),
+        InlineKeyboardButton("2️⃣ Full Season (Archive)", callback_data="mode_batch"),
+    )
+    bot.reply_to(message, "👋 Welcome! What would you like to process?", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("mode_"))
+def handle_mode_select(call):
+    chat_id = call.message.chat.id
+    mode = call.data.split("_")[1]
+
+    if chat_id not in user_sessions:
+        _reset_session(chat_id)
+
+    user_sessions[chat_id]["mode"] = mode
+    user_sessions[chat_id]["stage"] = "awaiting_drama_name"
+
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=call.message.message_id,
+        text="🔍 Type the drama name to search (e.g. 'Agent Kim').",
+    )
 
 
 @bot.message_handler(func=lambda m: user_sessions.get(m.chat.id, {}).get("stage") == "awaiting_drama_name")
@@ -88,9 +114,15 @@ def handle_season(message):
         bot.reply_to(message, "❌ Please send a valid number for season.")
         return
 
-    user_sessions[chat_id]["season"] = text
-    user_sessions[chat_id]["stage"] = "awaiting_episode"
-    bot.reply_to(message, "🎬 Now send the Episode Number (e.g. 7):")
+    session = user_sessions[chat_id]
+    session["season"] = text
+
+    if session["mode"] == "single":
+        session["stage"] = "awaiting_episode"
+        bot.reply_to(message, "🎬 Now send the Episode Number (e.g. 7):")
+    else:  # batch mode - no single episode number needed
+        session["stage"] = "awaiting_archive"
+        bot.reply_to(message, "📦 Now send the archive link (Pixeldrain 7z/zip with all episode videos):")
 
 
 @bot.message_handler(func=lambda m: user_sessions.get(m.chat.id, {}).get("stage") == "awaiting_episode")
@@ -105,6 +137,102 @@ def handle_episode(message):
     user_sessions[chat_id]["episode"] = text
     user_sessions[chat_id]["stage"] = "awaiting_srt"
     bot.reply_to(message, "📄 Now upload the .srt subtitle file.")
+
+
+@bot.message_handler(func=lambda m: user_sessions.get(m.chat.id, {}).get("stage") == "awaiting_archive")
+def handle_archive_link(message):
+    chat_id = message.chat.id
+    url = message.text.strip()
+
+    if not url.startswith("http"):
+        bot.reply_to(message, "❌ Please send a valid archive link.")
+        return
+
+    user_sessions[chat_id]["archive_url"] = url
+    user_sessions[chat_id]["stage"] = "awaiting_batch_srt"
+    user_sessions[chat_id]["srt_paths"] = []
+    bot.reply_to(
+        message,
+        "📄 Now send the .srt files one by one, IN EPISODE ORDER (Episode 1 first, then 2, 3...).\n"
+        "Type 'Done' when you've sent them all.",
+    )
+
+
+@bot.message_handler(
+    content_types=["document"],
+    func=lambda m: user_sessions.get(m.chat.id, {}).get("stage") == "awaiting_batch_srt",
+)
+def handle_batch_srt(message):
+    chat_id = message.chat.id
+    filename = message.document.file_name or ""
+    if not filename.lower().endswith(".srt"):
+        bot.reply_to(message, "❌ Please send a .srt subtitle file.")
+        return
+
+    file_info = bot.get_file(message.document.file_id)
+    downloaded = bot.download_file(file_info.file_path)
+    idx = len(user_sessions[chat_id]["srt_paths"]) + 1
+    srt_path = os.path.join(SUBS_DIR, f"{chat_id}_batch_ep{idx}.srt")
+    with open(srt_path, "wb") as f:
+        f.write(downloaded)
+
+    user_sessions[chat_id]["srt_paths"].append(srt_path)
+    bot.reply_to(message, f"✅ Episode {idx} srt saved. Send the next one, or type 'Done'.")
+
+
+@bot.message_handler(
+    func=lambda m: user_sessions.get(m.chat.id, {}).get("stage") == "awaiting_batch_srt"
+    and m.text
+    and m.text.strip().lower() == "done"
+)
+def handle_batch_done(message):
+    chat_id = message.chat.id
+    session = user_sessions[chat_id]
+
+    if not session["srt_paths"]:
+        bot.reply_to(message, "❌ You haven't sent any .srt files yet.")
+        return
+
+    session["stage"] = "awaiting_batch_sub_type"
+
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("🇺🇸 English SRTs (Translate & Burn)", callback_data="btype_english"),
+        InlineKeyboardButton("🇱🇰 Sinhala SRTs (Direct Burn)", callback_data="btype_sinhala"),
+    )
+    bot.send_message(
+        chat_id,
+        f"🎯 Got {len(session['srt_paths'])} subtitle files. What type are they?",
+        reply_markup=markup,
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("btype_"))
+def handle_batch_sub_type(call):
+    chat_id = call.message.chat.id
+    sub_type = call.data.split("_")[1]
+
+    session = user_sessions.get(chat_id)
+    if not session or not session.get("srt_paths"):
+        bot.answer_callback_query(call.id, "Session expired, please /start again.")
+        return
+
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=call.message.message_id,
+        text="⏳ Starting batch processing on GitHub Actions... This may take 1-2 hours.",
+    )
+
+    ok, result_msg = github_dispatch.run_batch_via_github_actions(
+        session["srt_paths"],
+        session["archive_url"],
+        sub_type,
+        chat_id,
+        tmdb_id=session["tmdb_id"],
+        season_number=session["season"],
+    )
+    bot.send_message(chat_id, result_msg)
+    _reset_session(chat_id)
 
 
 @bot.message_handler(content_types=["document"], func=lambda m: user_sessions.get(m.chat.id, {}).get("stage") == "awaiting_srt")

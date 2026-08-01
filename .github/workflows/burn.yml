@@ -104,7 +104,7 @@ jobs:
           INTRO_LINE2="Facebook Page: OnlyKSub"
           INTRO_LINE3="Telegram Channel: OnlyKSub"
           FILTER="[1:v]scale2ref=w=iw:h=ih[ov][base];[base][ov]overlay=0:0:format=auto[subbed];"
-          FILTER="${FILTER}[subbed]drawtext=text='${WATERMARK_TEXT}':fontfile=${SINHALA_FONT_PATH}:fontsize=28:fontcolor=white@0.75:borderw=2:bordercolor=black@0.6:x=w-tw-24:y=h-th-24[watermarked];"
+          FILTER="${FILTER}[subbed]drawtext=text='${WATERMARK_TEXT}':fontfile=${SINHALA_FONT_PATH}:fontsize=16:fontcolor=white@0.6:borderw=1:bordercolor=black@0.5:x=w-tw-16:y=h-th-16[watermarked];"
           FILTER="${FILTER}[watermarked]drawtext=text='${INTRO_LINE1}':fontfile=${SINHALA_FONT_PATH}:fontsize=44:fontcolor=cyan:borderw=3:bordercolor=black@0.8:x=(w-tw)/2:y=h*0.72:enable='lt(t\,6)',"
           FILTER="${FILTER}drawtext=text='${INTRO_LINE2}':fontfile=${SINHALA_FONT_PATH}:fontsize=26:fontcolor=white:borderw=2:bordercolor=black@0.8:x=(w-tw)/2:y=h*0.72+60:enable='lt(t\,6)',"
           FILTER="${FILTER}drawtext=text='${INTRO_LINE3}':fontfile=${SINHALA_FONT_PATH}:fontsize=26:fontcolor=white:borderw=2:bordercolor=black@0.8:x=(w-tw)/2:y=h*0.72+95:enable='lt(t\,6)'[v]"

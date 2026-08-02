@@ -174,8 +174,8 @@ jobs:
             INPUT_FILE=$(ls input_video_ep${EP_NUM}.* | head -1)
             WATERMARK_TEXT="OnlyKSub"
             FONT_DIR=$(pwd)/sinhala-font
-            SUB_STYLE="FontName=${SINHALA_FONT_NAME},FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,MarginV=40"
-            FILTER="subtitles=subs_ep${EP_NUM}.srt:fontsdir=${FONT_DIR}:force_style='${SUB_STYLE}',"
+            python scripts/srt_to_ass.py "subs_ep${EP_NUM}.srt" "subs_ep${EP_NUM}.ass" "$SINHALA_FONT_NAME"
+            FILTER="ass=subs_ep${EP_NUM}.ass:fontsdir=${FONT_DIR},"
             FILTER="${FILTER}drawtext=text='${WATERMARK_TEXT}':fontfile=${SINHALA_FONT_PATH}:fontsize=16:fontcolor=white@0.6:borderw=1:bordercolor=black@0.5:x=w-tw-16:y=h-th-16"
             ffmpeg -y -i "$INPUT_FILE" \
               -vf "$FILTER" \

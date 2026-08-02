@@ -38,22 +38,24 @@ jobs:
       - name: Checkout repo (for scripts)
         uses: actions/checkout@v4
 
-      - name: Install ffmpeg, libraqm, Pillow, and Sinhala font
+      - name: Install ffmpeg and Sinhala font (Noto Sans Sinhala)
         run: |
           set -e
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg libraqm0 fonts-noto-core
-          pip install --quiet --upgrade Pillow
-          python3 -c "from PIL import features; assert features.check('raqm'), 'raqm NOT available'; print('raqm OK')"
+          sudo apt-get install -y ffmpeg
           mkdir -p sinhala-font
-          curl -f -L -o sinhala-font/AbhayaLibre-Bold.ttf \
-            "https://github.com/google/fonts/raw/main/ofl/abhayalibre/AbhayaLibre-Bold.ttf"
-          if ! file sinhala-font/AbhayaLibre-Bold.ttf | grep -q "TrueType"; then
-            echo "ERROR: Font download failed or file is not a valid TTF"
+          curl -f -L -o sinhala-font/NotoSansSinhala-Bold.ttf \
+            "https://github.com/google/fonts/raw/main/ofl/notosanssinhala/NotoSansSinhala%5Bwdth%2Cwght%5D.ttf"
+          if ! file sinhala-font/NotoSansSinhala-Bold.ttf | grep -qE "TrueType|OpenType"; then
+            echo "ERROR: Font download failed or file is not a valid font"
             exit 1
           fi
-          echo "SINHALA_FONT_PATH=sinhala-font/AbhayaLibre-Bold.ttf" >> "$GITHUB_ENV"
-          echo "Font resolved to: sinhala-font/AbhayaLibre-Bold.ttf"
+          mkdir -p /usr/share/fonts/truetype/custom
+          sudo cp sinhala-font/NotoSansSinhala-Bold.ttf /usr/share/fonts/truetype/custom/
+          sudo fc-cache -f
+          echo "SINHALA_FONT_PATH=sinhala-font/NotoSansSinhala-Bold.ttf" >> "$GITHUB_ENV"
+          echo "SINHALA_FONT_NAME=Noto Sans Sinhala" >> "$GITHUB_ENV"
+          echo "Font resolved to: sinhala-font/NotoSansSinhala-Bold.ttf"
 
       - name: Set up Python deps
         run: |
@@ -89,25 +91,26 @@ jobs:
             exit 1
           fi
 
-      - name: Render subtitle overlay (Pillow + raqm - correct Sinhala shaping)
-        run: |
-          set -e
-          echo "Using font: $SINHALA_FONT_PATH"
-          python scripts/render_subtitles_overlay.py input_video.mp4 subs.srt overlay.mov "$SINHALA_FONT_PATH"
-
-      - name: Composite overlay + watermark + intro caption
+      - name: Burn subtitles + watermark (native ffmpeg/libass - fast single-pass)
         run: |
           set -e
           ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 input_video.mp4
+
           WATERMARK_TEXT="OnlyKSub"
-          INTRO_LINE1="OnlyKSub"
-          INTRO_LINE2="Facebook Page: OnlyKSub"
-          INTRO_LINE3="Telegram Channel: OnlyKSub"
-          FILTER="[1:v]scale2ref=w=iw:h=ih[ov][base];[base][ov]overlay=0:0:format=auto[subbed];"
-          FILTER="${FILTER}[subbed]drawtext=text='${WATERMARK_TEXT}':fontfile=${SINHALA_FONT_PATH}:fontsize=16:fontcolor=white@0.6:borderw=1:bordercolor=black@0.5:x=w-tw-16:y=h-th-16[watermarked];"
-          FILTER="${FILTER}[watermarked]null[v]"
-          ffmpeg -y -i input_video.mp4 -i overlay.mov -filter_complex "$FILTER" -map "[v]" -map 0:a? -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -c:a aac -b:a 160k -movflags +faststart output_final.mp4
-          echo "--- Output resolution ---"
+          FONT_DIR=$(pwd)/sinhala-font
+
+          SUB_STYLE="FontName=${SINHALA_FONT_NAME},FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,MarginV=40"
+
+          FILTER="subtitles=subs.srt:fontsdir=${FONT_DIR}:force_style='${SUB_STYLE}',"
+          FILTER="${FILTER}drawtext=text='${WATERMARK_TEXT}':fontfile=${SINHALA_FONT_PATH}:fontsize=16:fontcolor=white@0.6:borderw=1:bordercolor=black@0.5:x=w-tw-16:y=h-th-16"
+
+          ffmpeg -y -i input_video.mp4 \
+            -vf "$FILTER" \
+            -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p \
+            -c:a aac -b:a 160k \
+            -movflags +faststart \
+            output_final.mp4
+
           echo "--- Output resolution ---"
           ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 output_final.mp4
           ls -lh output_final.mp4

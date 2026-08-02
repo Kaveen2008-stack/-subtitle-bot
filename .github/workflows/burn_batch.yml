@@ -27,6 +27,16 @@ on:
         description: "Season number"
         required: true
         type: string
+      quality:
+        description: "Video quality label (1080p, 720p, 540p, 480p)"
+        required: false
+        type: string
+        default: "1080p"
+      sub_format:
+        description: "Subtitle format uploaded: srt or ass"
+        required: false
+        type: string
+        default: "srt"
 
 jobs:
   burn_batch:
@@ -216,7 +226,7 @@ jobs:
                 \"episode_number\": ${EP_NUM},
                 \"pixeldrain_download_url\": \"${PIXELDRAIN_LINK}\",
                 \"voe_embed_url\": \"${VOE_LINK}\",
-                \"quality\": \"1080p\"
+                \"quality\": \"${{ inputs.quality }}\"
               }"
 
             curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \

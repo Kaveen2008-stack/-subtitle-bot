@@ -45,6 +45,8 @@ def trigger_burn_workflow(
     tmdb_id,
     season_number,
     episode_number,
+    quality="1080p",
+    sub_format="srt",
 ) -> bool:
     try:
         url = f"{GITHUB_API}/repos/{config.GITHUB_REPO}/actions/workflows/burn.yml/dispatches"
@@ -58,6 +60,8 @@ def trigger_burn_workflow(
                 "tmdb_id": str(tmdb_id),
                 "season_number": str(season_number),
                 "episode_number": str(episode_number),
+                "quality": str(quality),
+                "sub_format": str(sub_format),
             },
         }
         resp = requests.post(url, headers=_headers(), json=payload, timeout=30)
@@ -109,12 +113,15 @@ def run_via_github_actions(
     tmdb_id=None,
     season_number=None,
     episode_number=None,
+    quality="1080p",
+    sub_format="srt",
 ) -> tuple[bool, str]:
     srt_url = push_srt_to_gist(srt_path, chat_id)
     if not srt_url:
         return False, "❌ Couldn't upload the subtitle file. Try again."
     if not trigger_burn_workflow(
-        video_url, srt_url, sub_type, chat_id, tmdb_id, season_number, episode_number
+        video_url, srt_url, sub_type, chat_id, tmdb_id, season_number, episode_number,
+        quality=quality, sub_format=sub_format,
     ):
         return False, "❌ Couldn't start the job. Check the bot's GitHub token/repo config."
     return True, "⏳ Job started on GitHub Actions. I'll message you here once it's done."

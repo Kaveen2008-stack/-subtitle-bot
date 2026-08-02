@@ -30,6 +30,16 @@ on:
         description: "Episode number"
         required: true
         type: string
+      quality:
+        description: "Video quality label (1080p, 720p, 540p, 480p)"
+        required: false
+        type: string
+        default: "1080p"
+      sub_format:
+        description: "Subtitle format uploaded: srt or ass"
+        required: false
+        type: string
+        default: "srt"
 jobs:
   burn:
     runs-on: ubuntu-latest
@@ -61,19 +71,26 @@ jobs:
         run: |
           pip install --quiet google-generativeai google-api-python-client google-auth requests
 
-      - name: Download SRT
-        run: curl -L -o subs_raw.srt "${{ inputs.srt_url }}"
+      - name: Download subtitle file
+        run: |
+          set -e
+          EXT="${{ inputs.sub_format }}"
+          if [ -z "$EXT" ]; then EXT="srt"; fi
+          curl -L -o "subs_raw.${EXT}" "${{ inputs.srt_url }}"
 
-      - name: Translate to Sinhala (only if needed)
-        if: inputs.sub_type == 'english'
+      - name: Translate to Sinhala (only if needed, srt only)
+        if: inputs.sub_type == 'english' && inputs.sub_format != 'ass'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python scripts/translate.py subs_raw.srt subs.srt
 
-      - name: Use subtitles as-is (already Sinhala)
-        if: inputs.sub_type != 'english'
+      - name: Use SRT as-is (already Sinhala)
+        if: inputs.sub_type != 'english' && inputs.sub_format != 'ass'
         run: cp subs_raw.srt subs.srt
 
+      - name: Use ASS as-is (skip translation/conversion)
+        if: inputs.sub_format == 'ass'
+        run: cp subs_raw.ass subs.ass
       - name: Download video
         run: |
           set -e
@@ -92,6 +109,7 @@ jobs:
           fi
 
       - name: Convert SRT to ASS (fixes Sinhala conjunct shaping in libass)
+        if: inputs.sub_format != 'ass'
         run: |
           set -e
           python scripts/srt_to_ass.py subs.srt subs.ass "$SINHALA_FONT_NAME"
@@ -185,7 +203,7 @@ jobs:
               \"episode_number\": ${{ inputs.episode_number }},
               \"pixeldrain_download_url\": \"${PIXELDRAIN_LINK}\",
               \"voe_embed_url\": \"${VOE_LINK}\",
-              \"quality\": \"1080p\"
+              \"quality\": \"${{ inputs.quality }}\"
             }"
 
       - name: Notify on Telegram

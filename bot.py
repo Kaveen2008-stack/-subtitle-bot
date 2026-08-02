@@ -28,6 +28,8 @@ def _reset_session(chat_id: int) -> None:
         "srt_path": None,
         "srt_paths": [],
         "sub_type": None,
+        "quality": None,
+        "sub_format": None,
         "stage": "awaiting_mode",
     }
 
@@ -135,8 +137,16 @@ def handle_episode(message):
         return
 
     user_sessions[chat_id]["episode"] = text
-    user_sessions[chat_id]["stage"] = "awaiting_srt"
-    bot.reply_to(message, "📄 Now upload the .srt subtitle file.")
+    user_sessions[chat_id]["stage"] = "awaiting_quality"
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("1080p", callback_data="q_1080p"),
+        InlineKeyboardButton("720p", callback_data="q_720p"),
+        InlineKeyboardButton("540p", callback_data="q_540p"),
+        InlineKeyboardButton("480p", callback_data="q_480p"),
+    )
+    bot.reply_to(message, "🎞️ What quality is the source video?", reply_markup=markup)
 
 
 @bot.message_handler(func=lambda m: user_sessions.get(m.chat.id, {}).get("stage") == "awaiting_archive")
@@ -235,21 +245,69 @@ def handle_batch_sub_type(call):
     _reset_session(chat_id)
 
 
+@bot.callback_query_handler(func=lambda call: call.data.startswith("q_"))
+def handle_quality_select(call):
+    chat_id = call.message.chat.id
+    quality = call.data.split("_", 1)[1]
+
+    session = user_sessions.get(chat_id)
+    if not session:
+        bot.answer_callback_query(call.id, "Session expired, please /start again.")
+        return
+
+    session["quality"] = quality
+    session["stage"] = "awaiting_sub_format"
+
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton(".srt file", callback_data="fmt_srt"),
+        InlineKeyboardButton(".ass file", callback_data="fmt_ass"),
+    )
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=call.message.message_id,
+        text=f"✅ Quality: {quality}\n\n📄 What subtitle format will you upload?",
+        reply_markup=markup,
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("fmt_"))
+def handle_format_select(call):
+    chat_id = call.message.chat.id
+    fmt = call.data.split("_", 1)[1]
+
+    session = user_sessions.get(chat_id)
+    if not session:
+        bot.answer_callback_query(call.id, "Session expired, please /start again.")
+        return
+
+    session["sub_format"] = fmt
+    session["stage"] = "awaiting_srt"
+
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=call.message.message_id,
+        text=f"📄 Now upload the .{fmt} subtitle file.",
+    )
+
+
 @bot.message_handler(content_types=["document"], func=lambda m: user_sessions.get(m.chat.id, {}).get("stage") == "awaiting_srt")
 def handle_srt(message):
     chat_id = message.chat.id
+    session = user_sessions.get(chat_id, {})
+    expected_ext = session.get("sub_format", "srt")
     filename = message.document.file_name or ""
-    if not filename.lower().endswith(".srt"):
-        bot.reply_to(message, "❌ Please send a .srt subtitle file.")
+    if not filename.lower().endswith(f".{expected_ext}"):
+        bot.reply_to(message, f"❌ Please send a .{expected_ext} subtitle file.")
         return
 
     if message.document.file_size and message.document.file_size > config.MAX_SRT_MB * 1024 * 1024:
-        bot.reply_to(message, f"❌ That SRT is too large (limit {config.MAX_SRT_MB}MB).")
+        bot.reply_to(message, f"❌ That file is too large (limit {config.MAX_SRT_MB}MB).")
         return
 
     file_info = bot.get_file(message.document.file_id)
     downloaded = bot.download_file(file_info.file_path)
-    srt_path = os.path.join(SUBS_DIR, f"{chat_id}_input.srt")
+    srt_path = os.path.join(SUBS_DIR, f"{chat_id}_input.{expected_ext}")
     with open(srt_path, "wb") as f:
         f.write(downloaded)
 
@@ -307,6 +365,8 @@ def handle_video_link(message):
         tmdb_id=session["tmdb_id"],
         season_number=session["season"],
         episode_number=session["episode"],
+        quality=session.get("quality", "1080p"),
+        sub_format=session.get("sub_format", "srt"),
     )
     bot.send_message(chat_id, result_msg)
     _reset_session(chat_id)

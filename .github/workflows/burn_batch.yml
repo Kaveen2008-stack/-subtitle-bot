@@ -36,17 +36,23 @@ jobs:
       - name: Checkout repo (for scripts)
         uses: actions/checkout@v4
 
-      - name: Install ffmpeg, libraqm, Pillow, Sinhala font, p7zip
+      - name: Install ffmpeg, Sinhala font (Noto Sans Sinhala), p7zip
         run: |
           set -e
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg libraqm0 fonts-noto-core p7zip-full unzip
-          pip install --quiet --upgrade Pillow
-          python3 -c "from PIL import features; assert features.check('raqm'), 'raqm NOT available'; print('raqm OK')"
+          sudo apt-get install -y ffmpeg p7zip-full unzip
           mkdir -p sinhala-font
-          curl -f -L -o sinhala-font/AbhayaLibre-Bold.ttf \
-            "https://github.com/google/fonts/raw/main/ofl/abhayalibre/AbhayaLibre-Bold.ttf"
-          echo "SINHALA_FONT_PATH=sinhala-font/AbhayaLibre-Bold.ttf" >> "$GITHUB_ENV"
+          curl -f -L -o sinhala-font/NotoSansSinhala-Bold.ttf \
+            "https://github.com/google/fonts/raw/main/ofl/notosanssinhala/NotoSansSinhala%5Bwdth%2Cwght%5D.ttf"
+          if ! file sinhala-font/NotoSansSinhala-Bold.ttf | grep -qE "TrueType|OpenType"; then
+            echo "ERROR: Font download failed or file is not a valid font"
+            exit 1
+          fi
+          mkdir -p /usr/share/fonts/truetype/custom
+          sudo cp sinhala-font/NotoSansSinhala-Bold.ttf /usr/share/fonts/truetype/custom/
+          sudo fc-cache -f
+          echo "SINHALA_FONT_PATH=sinhala-font/NotoSansSinhala-Bold.ttf" >> "$GITHUB_ENV"
+          echo "SINHALA_FONT_NAME=Noto Sans Sinhala" >> "$GITHUB_ENV"
 
       - name: Set up Python deps
         run: |
@@ -166,16 +172,13 @@ jobs:
 
             cp "$EP_PATH" "input_video_ep${EP_NUM}.mp4" || cp "$EP_PATH" "input_video_ep${EP_NUM}.mkv"
             INPUT_FILE=$(ls input_video_ep${EP_NUM}.* | head -1)
-
-            python scripts/render_subtitles_overlay.py "$INPUT_FILE" "subs_ep${EP_NUM}.srt" "overlay_ep${EP_NUM}.mov" "$SINHALA_FONT_PATH"
-
             WATERMARK_TEXT="OnlyKSub"
-            FILTER="[1:v]scale2ref=w=iw:h=ih[ov][base];[base][ov]overlay=0:0:format=auto[subbed];"
-            FILTER="${FILTER}[subbed]drawtext=text='${WATERMARK_TEXT}':fontfile=${SINHALA_FONT_PATH}:fontsize=16:fontcolor=white@0.6:borderw=1:bordercolor=black@0.5:x=w-tw-16:y=h-th-16[v]"
-
-            ffmpeg -y -i "$INPUT_FILE" -i "overlay_ep${EP_NUM}.mov" \
-              -filter_complex "$FILTER" \
-              -map "[v]" -map 0:a? \
+            FONT_DIR=$(pwd)/sinhala-font
+            SUB_STYLE="FontName=${SINHALA_FONT_NAME},FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,MarginV=40"
+            FILTER="subtitles=subs_ep${EP_NUM}.srt:fontsdir=${FONT_DIR}:force_style='${SUB_STYLE}',"
+            FILTER="${FILTER}drawtext=text='${WATERMARK_TEXT}':fontfile=${SINHALA_FONT_PATH}:fontsize=16:fontcolor=white@0.6:borderw=1:bordercolor=black@0.5:x=w-tw-16:y=h-th-16"
+            ffmpeg -y -i "$INPUT_FILE" \
+              -vf "$FILTER" \
               -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p \
               -c:a aac -b:a 160k \
               -movflags +faststart \

@@ -115,6 +115,30 @@ jobs:
           python scripts/srt_to_ass.py subs.srt subs.ass "$SINHALA_FONT_NAME"
           cat subs.ass
 
+      - name: Detect and remove black bars (letterbox crop)
+        run: |
+          set -e
+          CROP=$(ffmpeg -i input_video.mp4 -vf "cropdetect=24:16:0" -t 30 -f null - 2>&1 | grep -o "crop=[0-9:]*" | tail -1)
+          if [ -z "$CROP" ]; then
+            echo "No crop detected, using full frame."
+            echo "CROP_FILTER=" >> "$GITHUB_ENV"
+          else
+            echo "Detected: $CROP"
+            echo "CROP_FILTER=${CROP}," >> "$GITHUB_ENV"
+          fi
+
+      - name: Detect and remove black bars (letterbox crop)
+        run: |
+          set -e
+          CROP=$(ffmpeg -i input_video.mp4 -vf "cropdetect=24:16:0" -t 30 -f null - 2>&1 | grep -o "crop=[0-9:]*" | tail -1)
+          if [ -z "$CROP" ]; then
+            echo "No crop detected, using full frame."
+            echo "CROP_FILTER=" >> "$GITHUB_ENV"
+          else
+            echo "Detected: $CROP"
+            echo "CROP_FILTER=${CROP}," >> "$GITHUB_ENV"
+          fi
+
       - name: Burn subtitles + watermark (native ffmpeg/libass - fast single-pass)
         run: |
           set -e
@@ -123,7 +147,7 @@ jobs:
           WATERMARK_TEXT="OnlyKSub"
           FONT_DIR=$(pwd)/sinhala-font
 
-          FILTER="ass=subs.ass:fontsdir=${FONT_DIR},"
+          FILTER="${CROP_FILTER}ass=subs.ass:fontsdir=${FONT_DIR},"
           FILTER="${FILTER}drawtext=text='${WATERMARK_TEXT}':fontfile=${SINHALA_FONT_PATH}:fontsize=16:fontcolor=white@0.6:borderw=1:bordercolor=black@0.5:x=w-tw-16:y=h-th-16"
 
           ffmpeg -y -i input_video.mp4 \

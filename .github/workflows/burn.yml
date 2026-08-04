@@ -69,7 +69,7 @@ jobs:
 
       - name: Set up Python deps
         run: |
-          pip install --quiet google-generativeai google-api-python-client google-auth requests
+          pip install --quiet google-generativeai google-api-python-client google-auth requests Pillow
 
       - name: Download subtitle file
         run: |
@@ -115,12 +115,12 @@ jobs:
           python scripts/srt_to_ass.py subs.srt subs.ass "$SINHALA_FONT_NAME"
           cat subs.ass
 
-      - name: Detect and remove black bars (letterbox crop)
+      - name: Detect and remove black bars (robust pixel-based auto-crop)
         run: |
           set -e
-          CROP=$(ffmpeg -i input_video.mp4 -vf "cropdetect=40:16:0" -t 30 -f null - 2>&1 | grep -o "crop=[0-9:]*" | tail -1)
+          CROP=$(python3 scripts/detect_crop.py input_video.mp4 --threshold 24 --samples 30 | grep "^crop=" || true)
           if [ -z "$CROP" ]; then
-            echo "No crop detected, using full frame."
+            echo "No reliable crop detected (or safety guard tripped), using full frame."
             echo "CROP_FILTER=" >> "$GITHUB_ENV"
           else
             echo "Detected: $CROP"

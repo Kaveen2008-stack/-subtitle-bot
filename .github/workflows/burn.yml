@@ -118,7 +118,7 @@ jobs:
       - name: Detect and remove black bars (letterbox crop)
         run: |
           set -e
-          CROP=$(ffmpeg -i input_video.mp4 -vf "cropdetect=24:16:0" -t 30 -f null - 2>&1 | grep -o "crop=[0-9:]*" | tail -1)
+          CROP=$(ffmpeg -i input_video.mp4 -vf "cropdetect=40:16:0" -t 30 -f null - 2>&1 | grep -o "crop=[0-9:]*" | tail -1)
           if [ -z "$CROP" ]; then
             echo "No crop detected, using full frame."
             echo "CROP_FILTER=" >> "$GITHUB_ENV"
@@ -127,14 +127,6 @@ jobs:
             echo "CROP_FILTER=${CROP}," >> "$GITHUB_ENV"
           fi
 
-      - name: Detect and remove black bars (letterbox crop)
-        run: |
-          set -e
-          CROP=$(ffmpeg -i input_video.mp4 -vf "cropdetect=24:16:0" -t 30 -f null - 2>&1 | grep -o "crop=[0-9:]*" | tail -1)
-          if [ -z "$CROP" ]; then
-            echo "No crop detected, using full frame."
-            echo "CROP_FILTER=" >> "$GITHUB_ENV"
-          else
             echo "Detected: $CROP"
             echo "CROP_FILTER=${CROP}," >> "$GITHUB_ENV"
           fi

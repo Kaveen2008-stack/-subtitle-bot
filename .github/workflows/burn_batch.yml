@@ -182,7 +182,7 @@ jobs:
 
             cp "$EP_PATH" "input_video_ep${EP_NUM}.mp4" || cp "$EP_PATH" "input_video_ep${EP_NUM}.mkv"
             INPUT_FILE=$(ls input_video_ep${EP_NUM}.* | head -1)
-            CROP=$(ffmpeg -i "$INPUT_FILE" -vf "cropdetect=24:16:0" -t 30 -f null - 2>&1 | grep -o "crop=[0-9:]*" | tail -1)
+            CROP=$(ffmpeg -i "$INPUT_FILE" -vf "cropdetect=40:16:0" -t 30 -f null - 2>&1 | grep -o "crop=[0-9:]*" | tail -1)
             if [ -z "$CROP" ]; then
               CROP_FILTER=""
             else

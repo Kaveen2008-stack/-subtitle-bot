@@ -127,10 +127,6 @@ jobs:
             echo "CROP_FILTER=${CROP}," >> "$GITHUB_ENV"
           fi
 
-            echo "Detected: $CROP"
-            echo "CROP_FILTER=${CROP}," >> "$GITHUB_ENV"
-          fi
-
       - name: Burn subtitles + watermark (native ffmpeg/libass - fast single-pass)
         run: |
           set -e

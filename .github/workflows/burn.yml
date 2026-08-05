@@ -40,10 +40,30 @@ on:
         required: false
         type: string
         default: "srt"
+      job_id:
+        description: "Supabase job UUID (for dashboard tracking)"
+        required: false
+        type: string
+      telegram_message_id:
+        description: "Telegram message ID to edit for live progress"
+        required: false
+        type: string
+
+concurrency:
+  group: burn-${{ inputs.chat_id }}-${{ inputs.tmdb_id }}-${{ inputs.episode_number }}
+  cancel-in-progress: false
+
 jobs:
   burn:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ inputs.chat_id }}
+      JOB_ID: ${{ inputs.job_id }}
+      TELEGRAM_MESSAGE_ID: ${{ inputs.telegram_message_id }}
     steps:
       - name: Checkout repo (for scripts)
         uses: actions/checkout@v4
@@ -65,7 +85,7 @@ jobs:
           sudo fc-cache -f
           echo "SINHALA_FONT_PATH=sinhala-font/NotoSansSinhala-Bold.ttf" >> "$GITHUB_ENV"
           echo "SINHALA_FONT_NAME=Noto Sans Sinhala" >> "$GITHUB_ENV"
-          echo "Font resolved to: sinhala-font/NotoSansSinhala-Bold.ttf"
+          chmod +x scripts/report_status.sh
 
       - name: Set up Python deps
         run: |
@@ -82,7 +102,11 @@ jobs:
         if: inputs.sub_type == 'english' && inputs.sub_format != 'ass'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python scripts/translate.py subs_raw.srt subs.srt
+        run: |
+          ./scripts/report_status.sh "translate" "started"
+          python scripts/translate.py subs_raw.srt subs.srt \
+            && ./scripts/report_status.sh "translate" "success" \
+            || { ./scripts/report_status.sh "translate" "failed"; exit 1; }
 
       - name: Use SRT as-is (already Sinhala)
         if: inputs.sub_type != 'english' && inputs.sub_format != 'ass'
@@ -91,22 +115,30 @@ jobs:
       - name: Use ASS as-is (skip translation/conversion)
         if: inputs.sub_format == 'ass'
         run: cp subs_raw.ass subs.ass
+
       - name: Download video
         run: |
           set -e
+          ./scripts/report_status.sh "download" "started"
           URL="${{ inputs.video_url }}"
           if echo "$URL" | grep -q "pixeldrain.com/u/"; then
             FILE_ID=$(echo "$URL" | sed -E 's#.*pixeldrain\.com/u/([a-zA-Z0-9]+).*#\1#')
             URL="https://pixeldrain.com/api/file/${FILE_ID}"
           fi
-          curl -f -L -A "Mozilla/5.0" -e "https://pixeldrain.com/" -o input_video.mp4 "$URL"
+          if ! curl -f -L -A "Mozilla/5.0" -e "https://pixeldrain.com/" -o input_video.mp4 "$URL"; then
+            ./scripts/report_status.sh "download" "failed" '{"reason":"curl download failed"}'
+            exit 1
+          fi
           ls -lh input_video.mp4
           file input_video.mp4
           if ! file input_video.mp4 | grep -qE "MP4|Matroska|ISO Media|WebM"; then
+            ./scripts/report_status.sh "download" "failed" '{"reason":"not a valid video file"}'
             echo "ERROR: downloaded file is not a valid video (link may be expired/invalid)"
             head -c 500 input_video.mp4
             exit 1
           fi
+          SIZE=$(du -h input_video.mp4 | cut -f1)
+          ./scripts/report_status.sh "download" "success" "{\"size\":\"${SIZE}\"}"
 
       - name: Convert SRT to ASS (fixes Sinhala conjunct shaping in libass)
         if: inputs.sub_format != 'ass'
@@ -118,18 +150,22 @@ jobs:
       - name: Detect and remove black bars (robust pixel-based auto-crop)
         run: |
           set -e
+          ./scripts/report_status.sh "crop_detect" "started"
           CROP=$(python3 scripts/detect_crop.py input_video.mp4 --threshold 24 --samples 30 | grep "^crop=" || true)
           if [ -z "$CROP" ]; then
             echo "No reliable crop detected (or safety guard tripped), using full frame."
             echo "CROP_FILTER=" >> "$GITHUB_ENV"
+            ./scripts/report_status.sh "crop_detect" "success" '{"crop":"none - full frame used"}'
           else
             echo "Detected: $CROP"
             echo "CROP_FILTER=${CROP}," >> "$GITHUB_ENV"
+            ./scripts/report_status.sh "crop_detect" "success" "{\"crop\":\"${CROP}\"}"
           fi
 
       - name: Burn subtitles + watermark (native ffmpeg/libass - fast single-pass)
         run: |
           set -e
+          ./scripts/report_status.sh "burn" "started"
           ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 input_video.mp4
 
           WATERMARK_TEXT="OnlyKSub"
@@ -138,16 +174,20 @@ jobs:
           FILTER="${CROP_FILTER}ass=subs.ass:fontsdir=${FONT_DIR},"
           FILTER="${FILTER}drawtext=text='${WATERMARK_TEXT}':fontfile=${SINHALA_FONT_PATH}:fontsize=16:fontcolor=white@0.6:borderw=1:bordercolor=black@0.5:x=w-tw-16:y=h-th-16"
 
-          ffmpeg -y -i input_video.mp4 \
+          if ! ffmpeg -y -i input_video.mp4 \
             -vf "$FILTER" \
             -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p \
             -c:a aac -b:a 160k \
             -movflags +faststart \
-            output_final.mp4
+            output_final.mp4; then
+            ./scripts/report_status.sh "burn" "failed"
+            exit 1
+          fi
 
           echo "--- Output resolution ---"
           ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 output_final.mp4
           ls -lh output_final.mp4
+          ./scripts/report_status.sh "burn" "success"
 
       - name: Upload to Google Drive
         id: drive
@@ -157,9 +197,15 @@ jobs:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
           set -e
+          ./scripts/report_status.sh "upload_drive" "started"
           echo "$GDRIVE_SA_JSON_B64" | base64 -d > sa.json
-          GDRIVE_SA_JSON=sa.json python scripts/upload_drive.py output_final.mp4
-          echo "link=$(cat drive_link.txt)" >> "$GITHUB_OUTPUT"
+          if GDRIVE_SA_JSON=sa.json python scripts/upload_drive.py output_final.mp4; then
+            echo "link=$(cat drive_link.txt)" >> "$GITHUB_OUTPUT"
+            ./scripts/report_status.sh "upload_drive" "success" "{\"link\":\"$(cat drive_link.txt)\"}"
+          else
+            ./scripts/report_status.sh "upload_drive" "failed"
+            exit 1
+          fi
 
       - name: Upload to Pixeldrain
         id: pixeldrain
@@ -168,8 +214,14 @@ jobs:
           PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
         run: |
           set -e
-          python scripts/upload_pixeldrain.py output_final.mp4
-          echo "link=$(cat pixeldrain_link.txt)" >> "$GITHUB_OUTPUT"
+          ./scripts/report_status.sh "upload_pixeldrain" "started"
+          if python scripts/upload_pixeldrain.py output_final.mp4; then
+            echo "link=$(cat pixeldrain_link.txt)" >> "$GITHUB_OUTPUT"
+            ./scripts/report_status.sh "upload_pixeldrain" "success" "{\"link\":\"$(cat pixeldrain_link.txt)\"}"
+          else
+            ./scripts/report_status.sh "upload_pixeldrain" "failed"
+            exit 1
+          fi
 
       - name: Upload to VOE.sx
         id: voe
@@ -178,6 +230,7 @@ jobs:
           VOE_API_KEY: ${{ secrets.VOE_API_KEY }}
         run: |
           set -e
+          ./scripts/report_status.sh "upload_voe" "started"
           PIXELDRAIN_LINK="${{ steps.pixeldrain.outputs.link }}"
           RESPONSE=$(curl -s "https://voe.sx/api/upload/url?key=${VOE_API_KEY}&url=${PIXELDRAIN_LINK}")
           echo "VOE upload response: $RESPONSE"
@@ -192,10 +245,12 @@ jobs:
             if [ "$PERCENT" = "100" ]; then
               echo "link=https://voe.sx/e/${FILE_CODE}" >> "$GITHUB_OUTPUT"
               echo "VOE embed link ready: https://voe.sx/e/${FILE_CODE}"
+              ./scripts/report_status.sh "upload_voe" "success" "{\"link\":\"https://voe.sx/e/${FILE_CODE}\"}"
               exit 0
             fi
           done
           echo "VOE processing timed out"
+          ./scripts/report_status.sh "upload_voe" "failed" '{"reason":"timed out"}'
           exit 1
 
       - name: Notify website (webhook)
@@ -206,6 +261,7 @@ jobs:
           PIXELDRAIN_LINK: ${{ steps.pixeldrain.outputs.link }}
           VOE_LINK: ${{ steps.voe.outputs.link }}
         run: |
+          ./scripts/report_status.sh "webhook_notify" "started"
           curl -s -X POST "https://onlyksub.vercel.app/api/webhook-hardcode-complete" \
             -H "Content-Type: application/json" \
             -H "x-webhook-secret: ${WEBHOOK_SECRET}" \
@@ -216,7 +272,23 @@ jobs:
               \"pixeldrain_download_url\": \"${PIXELDRAIN_LINK}\",
               \"voe_embed_url\": \"${VOE_LINK}\",
               \"quality\": \"${{ inputs.quality }}\"
-            }"
+            }" \
+            && ./scripts/report_status.sh "webhook_notify" "success" \
+            || ./scripts/report_status.sh "webhook_notify" "failed"
+
+      - name: Mark job done in dashboard
+        if: always()
+        run: |
+          if [ -n "$SUPABASE_URL" ] && [ -n "$JOB_ID" ]; then
+            FINAL_STATUS="done"
+            if [ "${{ job.status }}" != "success" ]; then FINAL_STATUS="failed"; fi
+            curl -s -o /dev/null -X PATCH "${SUPABASE_URL}/rest/v1/jobs?id=eq.${JOB_ID}" \
+              -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+              -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+              -H "Content-Type: application/json" \
+              -d "{\"status\":\"${FINAL_STATUS}\",\"finished_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"github_run_url\":\"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\",\"output_links\":{\"pixeldrain\":\"${{ steps.pixeldrain.outputs.link }}\",\"drive\":\"${{ steps.drive.outputs.link }}\",\"voe\":\"${{ steps.voe.outputs.link }}\"}}" \
+              || true
+          fi
 
       - name: Notify on Telegram
         if: always()

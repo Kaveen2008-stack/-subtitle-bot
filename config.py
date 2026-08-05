@@ -17,4 +17,7 @@ GITHUB_REPO = _require("GITHUB_REPO")            # "owner/repo"
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 TMDB_API_KEY = _require("TMDB_API_KEY")          # for drama name search
 
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
 MAX_SRT_MB = 2  # sanity limit for subtitle uploads

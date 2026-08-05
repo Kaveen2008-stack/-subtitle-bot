@@ -47,23 +47,31 @@ def trigger_burn_workflow(
     episode_number,
     quality="1080p",
     sub_format="srt",
+    job_id=None,
+    telegram_message_id=None,
 ) -> bool:
     try:
         url = f"{GITHUB_API}/repos/{config.GITHUB_REPO}/actions/workflows/burn.yml/dispatches"
-        payload = {
-            "ref": config.GITHUB_BRANCH,
-            "inputs": {
-                "video_url": video_url,
-                "srt_url": srt_url,
-                "sub_type": sub_type,
-                "chat_id": str(chat_id),
-                "tmdb_id": str(tmdb_id),
-                "season_number": str(season_number),
-                "episode_number": str(episode_number),
-                "quality": str(quality),
-                "sub_format": str(sub_format),
-            },
+        inputs = {
+            "video_url": video_url,
+            "srt_url": srt_url,
+            "sub_type": sub_type,
+            "chat_id": str(chat_id),
+            "tmdb_id": str(tmdb_id),
+            "season_number": str(season_number),
+            "episode_number": str(episode_number),
+            "quality": str(quality),
+            "sub_format": str(sub_format),
         }
+        # Only include these if we actually have them (they're optional
+        # workflow inputs - dashboard tracking still works fine without
+        # them, the workflow just skips the Supabase/Telegram reporting).
+        if job_id:
+            inputs["job_id"] = str(job_id)
+        if telegram_message_id:
+            inputs["telegram_message_id"] = str(telegram_message_id)
+
+        payload = {"ref": config.GITHUB_BRANCH, "inputs": inputs}
         resp = requests.post(url, headers=_headers(), json=payload, timeout=30)
         if resp.status_code == 204:
             return True
@@ -81,24 +89,27 @@ def trigger_burn_batch_workflow(
     chat_id,
     tmdb_id,
     season_number,
-    quality="1080p",  # FIX: was silently missing before - batch jobs always
-                       # used burn_batch.yml's own hardcoded default instead
-                       # of whatever the user actually picked in the bot.
+    quality="1080p",
+    job_id=None,
+    telegram_message_id=None,
 ) -> bool:
     try:
         url = f"{GITHUB_API}/repos/{config.GITHUB_REPO}/actions/workflows/burn_batch.yml/dispatches"
-        payload = {
-            "ref": config.GITHUB_BRANCH,
-            "inputs": {
-                "archive_url": archive_url,
-                "srt_urls": ",".join(srt_urls),
-                "sub_type": sub_type,
-                "chat_id": str(chat_id),
-                "tmdb_id": str(tmdb_id),
-                "season_number": str(season_number),
-                "quality": str(quality),
-            },
+        inputs = {
+            "archive_url": archive_url,
+            "srt_urls": ",".join(srt_urls),
+            "sub_type": sub_type,
+            "chat_id": str(chat_id),
+            "tmdb_id": str(tmdb_id),
+            "season_number": str(season_number),
+            "quality": str(quality),
         }
+        if job_id:
+            inputs["job_id"] = str(job_id)
+        if telegram_message_id:
+            inputs["telegram_message_id"] = str(telegram_message_id)
+
+        payload = {"ref": config.GITHUB_BRANCH, "inputs": inputs}
         resp = requests.post(url, headers=_headers(), json=payload, timeout=30)
         if resp.status_code == 204:
             return True
@@ -119,6 +130,8 @@ def run_via_github_actions(
     episode_number=None,
     quality="1080p",
     sub_format="srt",
+    job_id=None,
+    telegram_message_id=None,
 ) -> tuple[bool, str]:
     srt_url = push_srt_to_gist(srt_path, chat_id)
     if not srt_url:
@@ -126,6 +139,7 @@ def run_via_github_actions(
     if not trigger_burn_workflow(
         video_url, srt_url, sub_type, chat_id, tmdb_id, season_number, episode_number,
         quality=quality, sub_format=sub_format,
+        job_id=job_id, telegram_message_id=telegram_message_id,
     ):
         return False, "❌ Couldn't start the job. Check the bot's GitHub token/repo config."
     return True, "⏳ Job started on GitHub Actions. I'll message you here once it's done."
@@ -138,7 +152,9 @@ def run_batch_via_github_actions(
     chat_id,
     tmdb_id=None,
     season_number=None,
-    quality="1080p",  # FIX: now accepted and threaded through to the workflow
+    quality="1080p",
+    job_id=None,
+    telegram_message_id=None,
 ) -> tuple[bool, str]:
     srt_urls = []
     for i, path in enumerate(srt_paths):
@@ -149,7 +165,7 @@ def run_batch_via_github_actions(
 
     if not trigger_burn_batch_workflow(
         archive_url, srt_urls, sub_type, chat_id, tmdb_id, season_number,
-        quality=quality,
+        quality=quality, job_id=job_id, telegram_message_id=telegram_message_id,
     ):
         return False, "❌ Couldn't start the batch job. Check the bot's GitHub token/repo config."
     return True, f"⏳ Batch job started for {len(srt_urls)} episodes ({quality}). This may take 1-2 hours. I'll notify you as each episode completes."

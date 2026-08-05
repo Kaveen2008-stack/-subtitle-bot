@@ -2,6 +2,7 @@ import functools
 import json
 import os
 
+import requests
 import telebot
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -16,7 +17,7 @@ bot = telebot.TeleBot(config.TELEGRAM_BOT_TOKEN)
 SUBS_DIR = "subs"
 os.makedirs(SUBS_DIR, exist_ok=True)
 
-# --- FIX #3: session persistence (survives restarts/crashes) -----------
+# --- session persistence (survives restarts/crashes) --------------------
 SESSIONS_FILE = "sessions.json"
 user_sessions: dict[int, dict] = {}
 
@@ -27,7 +28,6 @@ def _load_sessions() -> None:
         try:
             with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-            # JSON keys are always strings; convert back to int chat_ids
             user_sessions = {int(k): v for k, v in raw.items()}
             log.info(f"Loaded {len(user_sessions)} saved session(s) from disk.")
         except Exception:
@@ -45,7 +45,7 @@ def _save_sessions() -> None:
 
 def _reset_session(chat_id: int) -> None:
     user_sessions[chat_id] = {
-        "mode": None,  # "single" or "batch"
+        "mode": None,
         "tmdb_id": None,
         "drama_name": None,
         "season": None,
@@ -65,11 +65,71 @@ def _reset_session(chat_id: int) -> None:
 _load_sessions()
 
 
-# --- FIX #5: wrap every handler so one crash can't silently hang a user -
+# --- Dashboard integration: create a job row in Supabase ---------------
+# Requires config.SUPABASE_URL and config.SUPABASE_SERVICE_ROLE_KEY to be
+# set (same values as the GitHub Actions secrets). If they're missing, the
+# bot still works fine - dashboard tracking is just skipped, never blocks
+# the actual burn job.
+def _create_job_record(chat_id, tmdb_id, drama_name, season, episode, mode, quality) -> str | None:
+    supabase_url = getattr(config, "SUPABASE_URL", None)
+    supabase_key = getattr(config, "SUPABASE_SERVICE_ROLE_KEY", None)
+    if not supabase_url or not supabase_key:
+        log.warning("Supabase env vars not set, skipping dashboard job creation.")
+        return None
+
+    try:
+        resp = requests.post(
+            f"{supabase_url}/rest/v1/jobs",
+            headers={
+                "apikey": supabase_key,
+                "Authorization": f"Bearer {supabase_key}",
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            },
+            json={
+                "chat_id": str(chat_id),
+                "tmdb_id": str(tmdb_id) if tmdb_id else None,
+                "drama_name": drama_name,
+                "season_number": str(season) if season else None,
+                "episode_number": str(episode) if episode else None,
+                "mode": mode,
+                "quality": quality,
+                "status": "queued",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data[0]["id"] if data else None
+    except Exception:
+        log.exception("Failed to create Supabase job record (continuing anyway).")
+        return None
+
+
+def _update_job_message_id(job_id: str, message_id: int) -> None:
+    supabase_url = getattr(config, "SUPABASE_URL", None)
+    supabase_key = getattr(config, "SUPABASE_SERVICE_ROLE_KEY", None)
+    if not supabase_url or not supabase_key or not job_id:
+        return
+    try:
+        requests.patch(
+            f"{supabase_url}/rest/v1/jobs?id=eq.{job_id}",
+            headers={
+                "apikey": supabase_key,
+                "Authorization": f"Bearer {supabase_key}",
+                "Content-Type": "application/json",
+            },
+            json={"telegram_message_id": message_id},
+            timeout=15,
+        )
+    except Exception:
+        log.exception("Failed to update job's telegram_message_id (continuing anyway).")
+
+
+# --- wrap every handler so one crash can't silently hang a user --------
 def safe_handler(func):
     @functools.wraps(func)
     def wrapper(update, *args, **kwargs):
-        # update is either a Message or a CallbackQuery
         chat_id = getattr(update, "chat", None)
         chat_id = chat_id.id if chat_id else getattr(getattr(update, "message", None), "chat", None)
         chat_id = chat_id.id if hasattr(chat_id, "id") else chat_id
@@ -86,8 +146,6 @@ def safe_handler(func):
             except Exception:
                 log.exception("Also failed to notify user about the crash.")
         finally:
-            # Always ack callback queries, even on failure, so the button
-            # stops spinning on the user's client (fixes issue #2).
             if hasattr(update, "id") and hasattr(update, "data"):
                 try:
                     bot.answer_callback_query(update.id)
@@ -123,7 +181,7 @@ def handle_mode_select(call):
     user_sessions[chat_id]["stage"] = "awaiting_drama_name"
     _save_sessions()
 
-    bot.answer_callback_query(call.id)  # FIX #2: stop the button spinner
+    bot.answer_callback_query(call.id)
     bot.edit_message_text(
         chat_id=chat_id,
         message_id=call.message.message_id,
@@ -171,7 +229,7 @@ def handle_drama_select(call):
     session["stage"] = "awaiting_season"
     _save_sessions()
 
-    bot.answer_callback_query(call.id)  # FIX #2
+    bot.answer_callback_query(call.id)
     bot.edit_message_text(
         chat_id=chat_id,
         message_id=call.message.message_id,
@@ -196,7 +254,7 @@ def handle_season(message):
         session["stage"] = "awaiting_episode"
         _save_sessions()
         bot.reply_to(message, "🎬 Now send the Episode Number (e.g. 7):")
-    else:  # batch mode - no single episode number needed
+    else:
         session["stage"] = "awaiting_archive"
         _save_sessions()
         bot.reply_to(message, "📦 Now send the archive link (Pixeldrain 7z/zip with all episode videos):")
@@ -237,7 +295,6 @@ def handle_archive_link(message):
         return
 
     user_sessions[chat_id]["archive_url"] = url
-    # FIX #1: batch mode now asks quality too, before the srt files.
     user_sessions[chat_id]["stage"] = "awaiting_batch_quality"
     _save_sessions()
 
@@ -251,7 +308,6 @@ def handle_archive_link(message):
     bot.reply_to(message, "🎞️ What quality are the source videos in the archive?", reply_markup=markup)
 
 
-# --- FIX #1: batch quality selection (was completely missing before) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("bq_"))
 @safe_handler
 def handle_batch_quality_select(call):
@@ -268,7 +324,7 @@ def handle_batch_quality_select(call):
     session["srt_paths"] = []
     _save_sessions()
 
-    bot.answer_callback_query(call.id)  # FIX #2
+    bot.answer_callback_query(call.id)
     bot.edit_message_text(
         chat_id=chat_id,
         message_id=call.message.message_id,
@@ -344,14 +400,24 @@ def handle_batch_sub_type(call):
         bot.answer_callback_query(call.id, "Session expired, please /start again.")
         return
 
-    bot.answer_callback_query(call.id)  # FIX #2
+    bot.answer_callback_query(call.id)
     bot.edit_message_text(
         chat_id=chat_id,
         message_id=call.message.message_id,
         text="⏳ Starting batch processing on GitHub Actions... This may take 1-2 hours.",
     )
 
-    # FIX #1: quality now actually collected and forwarded.
+    # --- Dashboard: create a job record + a fresh progress message -----
+    job_id = _create_job_record(
+        chat_id, session["tmdb_id"], session["drama_name"], session["season"],
+        episode=None, mode="batch", quality=session.get("quality", "1080p"),
+    )
+    progress_msg = bot.send_message(
+        chat_id, f"⏳ {session['drama_name']} S{session['season']} (batch, {session.get('quality', '1080p')})",
+    )
+    if job_id:
+        _update_job_message_id(job_id, progress_msg.message_id)
+
     ok, result_msg = github_dispatch.run_batch_via_github_actions(
         session["srt_paths"],
         session["archive_url"],
@@ -360,6 +426,8 @@ def handle_batch_sub_type(call):
         tmdb_id=session["tmdb_id"],
         season_number=session["season"],
         quality=session.get("quality", "1080p"),
+        job_id=job_id,
+        telegram_message_id=progress_msg.message_id,
     )
     bot.send_message(chat_id, result_msg)
     _reset_session(chat_id)
@@ -385,7 +453,7 @@ def handle_quality_select(call):
         InlineKeyboardButton(".srt file", callback_data="fmt_srt"),
         InlineKeyboardButton(".ass file", callback_data="fmt_ass"),
     )
-    bot.answer_callback_query(call.id)  # FIX #2
+    bot.answer_callback_query(call.id)
     bot.edit_message_text(
         chat_id=chat_id,
         message_id=call.message.message_id,
@@ -409,7 +477,7 @@ def handle_format_select(call):
     session["stage"] = "awaiting_srt"
     _save_sessions()
 
-    bot.answer_callback_query(call.id)  # FIX #2
+    bot.answer_callback_query(call.id)
     bot.edit_message_text(
         chat_id=chat_id,
         message_id=call.message.message_id,
@@ -470,7 +538,7 @@ def handle_sub_type(call):
         if sub_type == "english"
         else "🔥 Sinhala subtitles — no translation needed.\n\n🔗 Now send your **video link** (Pixeldrain etc)."
     )
-    bot.answer_callback_query(call.id)  # FIX #2
+    bot.answer_callback_query(call.id)
     bot.edit_message_text(chat_id=chat_id, message_id=call.message.message_id, text=msg, parse_mode="Markdown")
 
 
@@ -489,7 +557,19 @@ def handle_video_link(message):
         bot.reply_to(message, "❌ Please send a valid video link (e.g. a Pixeldrain URL).")
         return
 
-    bot.send_message(chat_id, "⏳ Preparing your job for GitHub Actions...")
+    # --- Dashboard: create a job record + a fresh progress message -----
+    job_id = _create_job_record(
+        chat_id, session["tmdb_id"], session["drama_name"], session["season"],
+        episode=session["episode"], mode="single", quality=session.get("quality", "1080p"),
+    )
+    progress_msg = bot.send_message(
+        chat_id,
+        f"⏳ {session['drama_name']} S{session['season']}E{session['episode']} "
+        f"({session.get('quality', '1080p')})",
+    )
+    if job_id:
+        _update_job_message_id(job_id, progress_msg.message_id)
+
     ok, result_msg = github_dispatch.run_via_github_actions(
         session["srt_path"],
         url,
@@ -500,6 +580,8 @@ def handle_video_link(message):
         episode_number=session["episode"],
         quality=session.get("quality", "1080p"),
         sub_format=session.get("sub_format", "srt"),
+        job_id=job_id,
+        telegram_message_id=progress_msg.message_id,
     )
     bot.send_message(chat_id, result_msg)
     _reset_session(chat_id)
@@ -509,10 +591,6 @@ def main():
     log.info("Bot starting (polling)...")
     while True:
         try:
-            # FIX #4: drop any backlog of updates queued while the bot was
-            # down/restarting, and let a 409 (another instance already
-            # polling with this token) surface as a clear log line instead
-            # of silently retrying forever.
             bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
         except telebot.apihelper.ApiTelegramException as e:
             if getattr(e, "error_code", None) == 409:

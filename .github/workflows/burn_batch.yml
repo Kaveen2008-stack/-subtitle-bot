@@ -66,7 +66,7 @@ jobs:
 
       - name: Set up Python deps
         run: |
-          pip install --quiet google-generativeai google-api-python-client google-auth requests
+          pip install --quiet google-generativeai google-api-python-client google-auth requests Pillow
 
       - name: Download archive
         run: |

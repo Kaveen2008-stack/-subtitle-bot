@@ -81,6 +81,9 @@ def trigger_burn_batch_workflow(
     chat_id,
     tmdb_id,
     season_number,
+    quality="1080p",  # FIX: was silently missing before - batch jobs always
+                       # used burn_batch.yml's own hardcoded default instead
+                       # of whatever the user actually picked in the bot.
 ) -> bool:
     try:
         url = f"{GITHUB_API}/repos/{config.GITHUB_REPO}/actions/workflows/burn_batch.yml/dispatches"
@@ -93,6 +96,7 @@ def trigger_burn_batch_workflow(
                 "chat_id": str(chat_id),
                 "tmdb_id": str(tmdb_id),
                 "season_number": str(season_number),
+                "quality": str(quality),
             },
         }
         resp = requests.post(url, headers=_headers(), json=payload, timeout=30)
@@ -134,6 +138,7 @@ def run_batch_via_github_actions(
     chat_id,
     tmdb_id=None,
     season_number=None,
+    quality="1080p",  # FIX: now accepted and threaded through to the workflow
 ) -> tuple[bool, str]:
     srt_urls = []
     for i, path in enumerate(srt_paths):
@@ -143,7 +148,8 @@ def run_batch_via_github_actions(
         srt_urls.append(url)
 
     if not trigger_burn_batch_workflow(
-        archive_url, srt_urls, sub_type, chat_id, tmdb_id, season_number
+        archive_url, srt_urls, sub_type, chat_id, tmdb_id, season_number,
+        quality=quality,
     ):
         return False, "❌ Couldn't start the batch job. Check the bot's GitHub token/repo config."
-    return True, f"⏳ Batch job started for {len(srt_urls)} episodes. This may take 1-2 hours. I'll notify you as each episode completes."
+    return True, f"⏳ Batch job started for {len(srt_urls)} episodes ({quality}). This may take 1-2 hours. I'll notify you as each episode completes."

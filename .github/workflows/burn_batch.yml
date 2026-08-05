@@ -142,6 +142,7 @@ jobs:
           TMDB_ID: ${{ inputs.tmdb_id }}
           SEASON_NUMBER: ${{ inputs.season_number }}
           SUB_TYPE: ${{ inputs.sub_type }}
+          QUALITY: ${{ inputs.quality }}
           SRT_URLS_RAW: ${{ inputs.srt_urls }}
         run: |
           set -e
@@ -155,7 +156,7 @@ jobs:
           print(len(episodes))
           PYEOF
           EP_COUNT=$(cat episode_count.txt)
-          echo "Total episodes to process: $EP_COUNT"
+          echo "Total episodes to process: $EP_COUNT (quality: $QUALITY)"
 
           for i in $(seq 0 $((EP_COUNT - 1))); do
             EP_INFO=$(python3 -c "import json; d=json.load(open('episodes_list.json')); print(json.dumps(d[$i]))")
@@ -163,7 +164,7 @@ jobs:
             EP_PATH=$(echo "$EP_INFO" | python3 -c "import sys,json; print(json.load(sys.stdin)['path'])")
 
             echo "=================================================="
-            echo "Processing Episode $EP_NUM ($EP_PATH)"
+            echo "Processing Episode $EP_NUM ($EP_PATH) - Quality: $QUALITY"
             echo "=================================================="
 
             SRT_URL="${SRT_ARRAY[$i]}"
@@ -182,12 +183,21 @@ jobs:
 
             cp "$EP_PATH" "input_video_ep${EP_NUM}.mp4" || cp "$EP_PATH" "input_video_ep${EP_NUM}.mkv"
             INPUT_FILE=$(ls input_video_ep${EP_NUM}.* | head -1)
-            CROP=$(ffmpeg -i "$INPUT_FILE" -vf "cropdetect=40:16:0" -t 30 -f null - 2>&1 | grep -o "crop=[0-9:]*" | tail -1)
+
+            # Robust pixel-based auto-crop (same detector used by burn.yml) -
+            # replaces the old cropdetect/-t 30/tail -1 logic which only
+            # checked the first 30s and could be fooled by burnt-in subtitle
+            # text, missing black bars that only became stable later in the
+            # episode.
+            CROP=$(python3 scripts/detect_crop.py "$INPUT_FILE" --threshold 24 --samples 30 | grep "^crop=" || true)
             if [ -z "$CROP" ]; then
+              echo "Episode $EP_NUM: no reliable crop detected, using full frame."
               CROP_FILTER=""
             else
+              echo "Episode $EP_NUM: detected $CROP"
               CROP_FILTER="${CROP},"
             fi
+
             WATERMARK_TEXT="OnlyKSub"
             FONT_DIR=$(pwd)/sinhala-font
             python scripts/srt_to_ass.py "subs_ep${EP_NUM}.srt" "subs_ep${EP_NUM}.ass" "$SINHALA_FONT_NAME"
@@ -232,12 +242,12 @@ jobs:
                 \"episode_number\": ${EP_NUM},
                 \"pixeldrain_download_url\": \"${PIXELDRAIN_LINK}\",
                 \"voe_embed_url\": \"${VOE_LINK}\",
-                \"quality\": \"${{ inputs.quality }}\"
+                \"quality\": \"${QUALITY}\"
               }"
 
             curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
               -d chat_id="${CHAT_ID}" \
-              --data-urlencode text="✅ Episode ${EP_NUM} done! Pixeldrain: ${PIXELDRAIN_LINK}"
+              --data-urlencode text="✅ Episode ${EP_NUM} done (${QUALITY})! Pixeldrain: ${PIXELDRAIN_LINK}"
 
             rm -f "input_video_ep${EP_NUM}".* "output_ep${EP_NUM}.mp4" "overlay_ep${EP_NUM}.mov"
 

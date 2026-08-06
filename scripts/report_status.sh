@@ -24,7 +24,15 @@
 
 STEP="$1"
 STATUS="$2"
-DETAIL_JSON="${3:-{}}"
+DETAIL_JSON="$3"
+# NOTE: avoid the "${3:-{}}" one-liner here - bash's brace-matching for
+# parameter expansion gets confused by the literal { } characters inside
+# the default value, which can silently corrupt this variable and send
+# malformed JSON to Supabase (this was the actual root cause of the
+# "Empty or invalid json" / PGRST102 errors seen on real runs).
+if [ -z "$DETAIL_JSON" ]; then
+  DETAIL_JSON="{}"
+fi
 
 if [ -z "$STEP" ] || [ -z "$STATUS" ]; then
   echo "Usage: report_status.sh <step> <status> [detail_json]" >&2

@@ -53,12 +53,21 @@ esac
 
 # --- 1. Report to Supabase (job_events table - always, full detail) ----
 if [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_SERVICE_ROLE_KEY" ] && [ -n "$JOB_ID" ]; then
-  curl -s -o /dev/null -X POST "${SUPABASE_URL}/rest/v1/job_events" \
+  # -w writes the HTTP status code after the body, so we can tell success
+  # from failure even though curl doesn't use -f here (we WANT the body
+  # printed on error, and -f would suppress it).
+  RESP=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST "${SUPABASE_URL}/rest/v1/job_events" \
     -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
     -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
     -H "Content-Type: application/json" \
-    -d "{\"job_id\":\"${JOB_ID}\",\"step\":\"${STEP}\",\"status\":\"${STATUS}\",\"detail\":${DETAIL_JSON}}" \
-    || echo "WARNING: Supabase event report failed (continuing anyway)" >&2
+    -d "{\"job_id\":\"${JOB_ID}\",\"step\":\"${STEP}\",\"status\":\"${STATUS}\",\"detail\":${DETAIL_JSON}}")
+  HTTP_CODE=$(echo "$RESP" | grep -o "HTTP_STATUS:[0-9]*" | cut -d: -f2)
+  BODY=$(echo "$RESP" | sed '/HTTP_STATUS:/d')
+  if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+    echo "WARNING: Supabase job_events insert failed (HTTP $HTTP_CODE): $BODY" >&2
+  else
+    echo "Supabase job_events insert OK (HTTP $HTTP_CODE)" >&2
+  fi
 
   # On success/failed of a step, also bump the job's overall `status`
   # field so the dashboard's job list reflects "running" vs "failed"

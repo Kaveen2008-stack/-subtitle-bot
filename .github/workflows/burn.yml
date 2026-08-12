@@ -147,36 +147,36 @@ jobs:
             -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
             -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}")
           python3 -c "
-import json, sys, os
-try:
-    rows = json.loads(sys.argv[1])
-    if not rows:
-        raise ValueError('no settings row')
-    s = rows[0]
-    out = os.environ['GITHUB_ENV']
-    with open(out, 'a') as f:
-        f.write(f\"RENDER_FONT_SIZE={s.get('font_size', 42)}\n\")
-        f.write(f\"RENDER_MARGIN_V={s.get('margin_v', 14)}\n\")
-        f.write(f\"RENDER_OUTLINE={s.get('outline_width', 1)}\n\")
-        f.write(f\"RENDER_WATERMARK_TEXT={s.get('watermark_text', 'OnlyKSub')}\n\")
-        f.write(f\"RENDER_WATERMARK_OPACITY={s.get('watermark_opacity', 0.6)}\n\")
-        f.write(f\"RENDER_WATERMARK_FONTSIZE={s.get('watermark_fontsize', 16)}\n\")
-        f.write(f\"RENDER_CRF={s.get('crf', 23)}\n\")
-        f.write(f\"RENDER_AUDIO_BITRATE={s.get('audio_bitrate', '128k')}\n\")
-    print('Render settings loaded')
-except Exception as e:
-    print(f'WARNING: could not fetch render settings ({e}), using defaults', file=sys.stderr)
-    out = os.environ['GITHUB_ENV']
-    with open(out, 'a') as f:
-        f.write('RENDER_FONT_SIZE=42\n')
-        f.write('RENDER_MARGIN_V=14\n')
-        f.write('RENDER_OUTLINE=1\n')
-        f.write('RENDER_WATERMARK_TEXT=OnlyKSub\n')
-        f.write('RENDER_WATERMARK_OPACITY=0.6\n')
-        f.write('RENDER_WATERMARK_FONTSIZE=16\n')
-        f.write('RENDER_CRF=23\n')
-        f.write('RENDER_AUDIO_BITRATE=128k\n')
-" "$RESULT"
+          import json, sys, os
+          try:
+              rows = json.loads(sys.argv[1])
+              if not rows:
+                  raise ValueError('no settings row')
+              s = rows[0]
+              out = os.environ['GITHUB_ENV']
+              with open(out, 'a') as f:
+                  f.write(f\"RENDER_FONT_SIZE={s.get('font_size', 42)}\n\")
+                  f.write(f\"RENDER_MARGIN_V={s.get('margin_v', 14)}\n\")
+                  f.write(f\"RENDER_OUTLINE={s.get('outline_width', 1)}\n\")
+                  f.write(f\"RENDER_WATERMARK_TEXT={s.get('watermark_text', 'OnlyKSub')}\n\")
+                  f.write(f\"RENDER_WATERMARK_OPACITY={s.get('watermark_opacity', 0.6)}\n\")
+                  f.write(f\"RENDER_WATERMARK_FONTSIZE={s.get('watermark_fontsize', 16)}\n\")
+                  f.write(f\"RENDER_CRF={s.get('crf', 23)}\n\")
+                  f.write(f\"RENDER_AUDIO_BITRATE={s.get('audio_bitrate', '128k')}\n\")
+              print('Render settings loaded')
+          except Exception as e:
+              print(f'WARNING: could not fetch render settings ({e}), using defaults', file=sys.stderr)
+              out = os.environ['GITHUB_ENV']
+              with open(out, 'a') as f:
+                  f.write('RENDER_FONT_SIZE=42\n')
+                  f.write('RENDER_MARGIN_V=14\n')
+                  f.write('RENDER_OUTLINE=1\n')
+                  f.write('RENDER_WATERMARK_TEXT=OnlyKSub\n')
+                  f.write('RENDER_WATERMARK_OPACITY=0.6\n')
+                  f.write('RENDER_WATERMARK_FONTSIZE=16\n')
+                  f.write('RENDER_CRF=23\n')
+                  f.write('RENDER_AUDIO_BITRATE=128k\n')
+          " "$RESULT"
 
       - name: Convert SRT to ASS (fixes Sinhala conjunct shaping in libass)
         if: inputs.sub_format != 'ass'

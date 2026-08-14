@@ -173,18 +173,43 @@ class KeyRotator:
               file=sys.stderr)
         self._configure_current()
 
-    def translate_with_rotation(self, blocks_chunk):
+    def translate_with_rotation(self, blocks_chunk, expected_indexes):
         """Try translating with the current key; on failure, retry a couple
         times, then rotate through remaining keys until one works or all
-        are exhausted."""
+        are exhausted.
+
+        Uses INDEX-BASED alignment rather than requiring an exact block
+        count match: Gemini occasionally merges/splits a line (e.g. 272
+        blocks sent, 271 or 273 come back) even though the actual
+        translation content is fine. Matching by each block's own leading
+        index number is far more robust than counting blocks."""
+        expected_set = set(expected_indexes)
         keys_tried = 0
         while keys_tried < len(self.api_keys):
             for attempt in range(MAX_RETRIES_PER_KEY):
                 try:
                     result = translate_chunk(self.model, blocks_chunk)
-                    if len(result) == len(blocks_chunk):
-                        return result
-                    print(f"  Block count mismatch (got {len(result)}, expected {len(blocks_chunk)}), "
+                    result_by_idx = {}
+                    for block in result:
+                        idx = get_index(block)
+                        if idx is not None and idx in expected_set:
+                            result_by_idx[idx] = block
+
+                    missing = expected_set - set(result_by_idx.keys())
+                    coverage = len(result_by_idx) / len(expected_set)
+
+                    if not missing:
+                        return result_by_idx  # perfect - every expected index accounted for
+                    if coverage >= 0.95:
+                        # Good enough - a stray line or two got merged/split.
+                        # Original English will be used as fallback for the
+                        # handful of missing indexes (filled in by caller).
+                        print(f"  Accepting partial result: {len(result_by_idx)}/{len(expected_set)} "
+                              f"blocks matched by index ({len(missing)} will fall back to original text).",
+                              file=sys.stderr)
+                        return result_by_idx
+
+                    print(f"  Too many blocks unmatched ({len(missing)}/{len(expected_set)} missing), "
                           f"retrying on same key...", file=sys.stderr)
                 except Exception as e:
                     err_str = str(e)
@@ -199,7 +224,7 @@ class KeyRotator:
             if keys_tried < len(self.api_keys):
                 self.rotate()
 
-        return None  # every key failed for this chunk
+        return {}  # every key failed for this chunk - caller falls back to original text
 
 
 def main():
@@ -232,17 +257,20 @@ def main():
         print(f"Translating blocks {start + 1}-{start + len(chunk)} of {len(all_blocks)}...",
               file=sys.stderr)
 
-        translated_chunk = rotator.translate_with_rotation(chunk)
+        result_by_idx = rotator.translate_with_rotation(chunk, expected_indexes)
 
-        if translated_chunk and len(translated_chunk) == len(chunk):
-            for idx, translated_block in zip(expected_indexes, translated_chunk):
-                translated_by_index[idx] = translated_block
-        else:
-            # Fallback: keep original English blocks for this chunk rather
-            # than losing/misaligning subtitles.
-            print(f"  WARNING: all keys exhausted or persistent mismatch - "
-                  f"keeping original text for blocks {start + 1}-{start + len(chunk)}",
-                  file=sys.stderr)
+        for idx, block in zip(expected_indexes, chunk):
+            if idx in result_by_idx:
+                translated_by_index[idx] = result_by_idx[idx]
+            else:
+                # Not matched even after retries/rotation - keep original
+                # text for just this one block rather than losing it.
+                translated_by_index[idx] = block
+
+        matched = sum(1 for idx in expected_indexes if idx in result_by_idx)
+        if matched < len(expected_indexes):
+            print(f"  WARNING: {len(expected_indexes) - matched} block(s) in this chunk "
+                  f"kept original text (untranslated).", file=sys.stderr)
             for idx, original_block in zip(expected_indexes, chunk):
                 translated_by_index[idx] = original_block
 

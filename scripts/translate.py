@@ -19,7 +19,11 @@ import re
 import sys
 import time
 
-BATCH_SIZE = 300          # SRT blocks per API call - tested safe up to 300 (350+ caused missing blocks)
+TARGET_CALLS = 3          # aim for this many API calls per episode - batch size is
+                           # calculated from actual block count (min 60, max 300 - the
+                           # tested-safe range; 350+ caused missing blocks in testing)
+MIN_BATCH_SIZE = 60
+MAX_BATCH_SIZE = 300
 MODEL_NAME = "gemini-3.5-flash"
 MAX_RETRIES_PER_KEY = 2   # retries on the SAME key before rotating to the next one
 COOLDOWN_SECONDS = 3      # brief pause between retries
@@ -209,13 +213,20 @@ def main():
         print("No subtitle blocks found.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Total blocks: {len(all_blocks)} | BATCH_SIZE: {BATCH_SIZE} | "
-          f"Calls needed: {-(-len(all_blocks) // BATCH_SIZE)}", file=sys.stderr)
+    # Work out batch size from the actual episode length, so every episode
+    # takes roughly TARGET_CALLS API calls regardless of how long it is.
+    import math
+    batch_size = math.ceil(len(all_blocks) / TARGET_CALLS)
+    batch_size = max(MIN_BATCH_SIZE, min(MAX_BATCH_SIZE, batch_size))
+
+    print(f"Total blocks: {len(all_blocks)} | Target calls: {TARGET_CALLS} | "
+          f"Computed BATCH_SIZE: {batch_size} | "
+          f"Actual calls needed: {-(-len(all_blocks) // batch_size)}", file=sys.stderr)
 
     translated_by_index = {}
 
-    for start in range(0, len(all_blocks), BATCH_SIZE):
-        chunk = all_blocks[start:start + BATCH_SIZE]
+    for start in range(0, len(all_blocks), batch_size):
+        chunk = all_blocks[start:start + batch_size]
         expected_indexes = [get_index(b) for b in chunk]
 
         print(f"Translating blocks {start + 1}-{start + len(chunk)} of {len(all_blocks)}...",

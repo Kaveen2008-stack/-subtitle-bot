@@ -132,7 +132,10 @@ def translate_chunk(model, blocks_chunk):
     joined = "\n\n".join(blocks_chunk)
     full_prompt = SYSTEM_PROMPT + "\n\n[SRT BLOCK TO TRANSLATE NOW]\n" + joined
 
-    response = model.generate_content(full_prompt)
+    response = model.generate_content(
+        full_prompt,
+        request_options={"timeout": 300},  # allow up to 5 min for large batches
+    )
     text = response.text.strip()
 
     # Strip accidental markdown code fences if the model adds them

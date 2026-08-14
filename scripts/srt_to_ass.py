@@ -3,6 +3,12 @@ Converts an .srt file to .ass format, preserving Unicode text exactly
 (including ZWJ/conjunct characters), so libass renders it via its
 ASS demuxer path (proven correct for Sinhala) instead of its SRT demuxer.
 
+Strips HTML-style tags that SRT files sometimes carry over from their
+source (e.g. Netflix/streaming rips wrap every line in
+<font color="white">...</font>), since ASS does not understand HTML tags
+and would otherwise burn them into the video as literal text. <i> tags
+are converted to the equivalent ASS override codes so italics still work.
+
 Usage (backward compatible - old 3-arg calls still work):
     python srt_to_ass.py subs.srt subs.ass "Noto Sans Sinhala"
     python srt_to_ass.py subs.srt subs.ass "Noto Sans Sinhala" --font-size 64 --margin-v 30 --outline 3
@@ -10,6 +16,30 @@ Usage (backward compatible - old 3-arg calls still work):
 import sys
 import re
 import argparse
+
+# Matches <font ...> and </font> (any attributes, case-insensitive)
+FONT_TAG_RE = re.compile(r"</?font[^>]*>", re.IGNORECASE)
+# Matches <i> and </i>
+ITALIC_OPEN_RE = re.compile(r"<i\s*>", re.IGNORECASE)
+ITALIC_CLOSE_RE = re.compile(r"</i\s*>", re.IGNORECASE)
+# Matches <b> and </b>
+BOLD_OPEN_RE = re.compile(r"<b\s*>", re.IGNORECASE)
+BOLD_CLOSE_RE = re.compile(r"</b\s*>", re.IGNORECASE)
+# Catch-all for any other stray HTML tag we don't explicitly handle
+STRAY_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
+
+
+def clean_line(text):
+    """Strip <font> tags entirely, convert <i>/<b> to ASS override codes,
+    and remove any other stray HTML tags so nothing leaks into the video
+    as literal text."""
+    text = FONT_TAG_RE.sub("", text)
+    text = ITALIC_OPEN_RE.sub(r"{\\i1}", text)
+    text = ITALIC_CLOSE_RE.sub(r"{\\i0}", text)
+    text = BOLD_OPEN_RE.sub(r"{\\b1}", text)
+    text = BOLD_CLOSE_RE.sub(r"{\\b0}", text)
+    text = STRAY_TAG_RE.sub("", text)  # anything else HTML-like left over
+    return text
 
 
 def srt_time_to_ass(t):
@@ -31,7 +61,8 @@ def parse_srt(path):
             start_str, end_str = [x.strip() for x in timing.split("-->")]
             start = srt_time_to_ass(start_str)
             end = srt_time_to_ass(end_str)
-            text = "\\N".join(lines[2:])  # ASS line-break token
+            text_lines = [clean_line(l) for l in lines[2:]]
+            text = "\\N".join(text_lines)  # ASS line-break token
             cues.append((start, end, text))
     return cues
 

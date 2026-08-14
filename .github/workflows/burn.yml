@@ -98,7 +98,11 @@ jobs:
           if [ -z "$EXT" ]; then EXT="srt"; fi
           curl -L -o "subs_raw.${EXT}" "${{ inputs.srt_url }}"
 
-      - name: Translate to Sinhala (only if needed, srt only)
+      - name: Clean subtitle (strip site credits/font tags - runs BEFORE translation)
+        if: inputs.sub_format != 'ass'
+        run: python scripts/clean_srt.py subs_raw.srt subs_cleaned.srt
+
+      - name: Translate to Sinhala (only if needed, after cleaning)
         if: inputs.sub_type == 'english' && inputs.sub_format != 'ass'
         env:
           GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
@@ -108,13 +112,13 @@ jobs:
           GEMINI_API_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
         run: |
           ./scripts/report_status.sh "translate" "started"
-          python scripts/translate.py subs_raw.srt subs.srt \
+          python scripts/translate.py subs_cleaned.srt subs.srt \
             && ./scripts/report_status.sh "translate" "success" \
             || { ./scripts/report_status.sh "translate" "failed"; exit 1; }
 
-      - name: Clean manual Sinhala sub (strip site credits/font tags)
+      - name: Use cleaned sub as-is (already Sinhala, no translation needed)
         if: inputs.sub_type != 'english' && inputs.sub_format != 'ass'
-        run: python scripts/clean_srt.py subs_raw.srt subs.srt
+        run: cp subs_cleaned.srt subs.srt
 
       - name: Use ASS as-is (skip translation/conversion)
         if: inputs.sub_format == 'ass'

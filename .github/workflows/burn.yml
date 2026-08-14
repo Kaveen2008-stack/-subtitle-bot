@@ -101,7 +101,11 @@ jobs:
       - name: Translate to Sinhala (only if needed, srt only)
         if: inputs.sub_type == 'english' && inputs.sub_format != 'ass'
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
+          GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
+          GEMINI_API_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
         run: |
           ./scripts/report_status.sh "translate" "started"
           python scripts/translate.py subs_raw.srt subs.srt \

@@ -3,16 +3,26 @@ Standalone English -> Sinhala SRT translator, run inside the GitHub Actions
 job. Uses the "MasterSub AI" persona prompt for natural, colloquial,
 emotionally-adapted Sri Lankan Sinhala subtitle translation.
 
+v2: Multi-key rotation (up to 5 Gemini API keys) + larger batch size to
+maximize daily throughput on the free tier while keeping Gemini 3.5 Flash
+for translation quality (Flash-Lite was tested and rejected - it produced
+occasional wrong-script/glitch characters in output).
+
 Usage:
     python translate.py input.srt output.srt
-Requires GEMINI_API_KEY in the environment.
+
+Requires GEMINI_API_KEY_1 .. GEMINI_API_KEY_5 in the environment
+(at least GEMINI_API_KEY_1 must be set; unset keys are simply skipped).
 """
 import os
 import re
 import sys
 import time
 
-BATCH_SIZE = 12  # SRT blocks per API call - keeps context tight for quality + reliability
+BATCH_SIZE = 300          # SRT blocks per API call - tested safe up to 300 (350+ caused missing blocks)
+MODEL_NAME = "gemini-3.5-flash"
+MAX_RETRIES_PER_KEY = 2   # retries on the SAME key before rotating to the next one
+COOLDOWN_SECONDS = 3      # brief pause between retries
 
 SYSTEM_PROMPT = """You are "MasterSub AI" — Sri Lanka's premiere K-Drama subtitle adapter, dubbing scriptwriter, and master native Sinhala storyteller.
 
@@ -82,9 +92,31 @@ EXECUTION MODE:
 Translate the provided SRT block now adhering strictly to all the rules above. Return ONLY the translated SRT content without any intro or outro text."""
 
 
+def load_api_keys():
+    """Collect GEMINI_API_KEY_1 .. GEMINI_API_KEY_5 (skip unset ones).
+    Falls back to plain GEMINI_API_KEY if none of the numbered ones exist,
+    so this stays compatible with older single-key setups."""
+    keys = []
+    for i in range(1, 6):
+        key = os.environ.get(f"GEMINI_API_KEY_{i}")
+        if key:
+            keys.append(key)
+    if not keys:
+        single = os.environ.get("GEMINI_API_KEY")
+        if single:
+            keys.append(single)
+    if not keys:
+        print("ERROR: No Gemini API keys found in environment "
+              "(expected GEMINI_API_KEY_1..GEMINI_API_KEY_5 or GEMINI_API_KEY).",
+              file=sys.stderr)
+        sys.exit(1)
+    print(f"Loaded {len(keys)} Gemini API key(s) for rotation.", file=sys.stderr)
+    return keys
+
+
 def parse_srt_blocks(path):
     """Return list of raw SRT block strings (index+timing+text), unmodified."""
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8-sig") as f:
         content = f.read()
     blocks = re.split(r"\n\s*\n", content.strip())
     return [b.strip() for b in blocks if b.strip()]
@@ -111,18 +143,71 @@ def translate_chunk(model, blocks_chunk):
     return [b.strip() for b in result_blocks if b.strip()]
 
 
+class KeyRotator:
+    """Holds a list of API keys and hands out a configured genai model,
+    rotating to the next key whenever the current one is rate-limited
+    or otherwise fails."""
+
+    def __init__(self, api_keys, model_name):
+        import google.generativeai as genai
+        self._genai = genai
+        self.api_keys = api_keys
+        self.model_name = model_name
+        self.current_idx = 0
+        self._configure_current()
+
+    def _configure_current(self):
+        self._genai.configure(api_key=self.api_keys[self.current_idx])
+        self.model = self._genai.GenerativeModel(self.model_name)
+
+    def rotate(self):
+        self.current_idx = (self.current_idx + 1) % len(self.api_keys)
+        print(f"  Rotating to API key #{self.current_idx + 1}/{len(self.api_keys)}",
+              file=sys.stderr)
+        self._configure_current()
+
+    def translate_with_rotation(self, blocks_chunk):
+        """Try translating with the current key; on failure, retry a couple
+        times, then rotate through remaining keys until one works or all
+        are exhausted."""
+        keys_tried = 0
+        while keys_tried < len(self.api_keys):
+            for attempt in range(MAX_RETRIES_PER_KEY):
+                try:
+                    result = translate_chunk(self.model, blocks_chunk)
+                    if len(result) == len(blocks_chunk):
+                        return result
+                    print(f"  Block count mismatch (got {len(result)}, expected {len(blocks_chunk)}), "
+                          f"retrying on same key...", file=sys.stderr)
+                except Exception as e:
+                    err_str = str(e)
+                    is_rate_limit = "429" in err_str or "quota" in err_str.lower() or "rate" in err_str.lower()
+                    print(f"  API call failed (attempt {attempt + 1}/{MAX_RETRIES_PER_KEY}) "
+                          f"on key #{self.current_idx + 1}: {e}", file=sys.stderr)
+                    if is_rate_limit:
+                        break  # don't waste retries on a rate-limited key, rotate immediately
+                time.sleep(COOLDOWN_SECONDS)
+
+            keys_tried += 1
+            if keys_tried < len(self.api_keys):
+                self.rotate()
+
+        return None  # every key failed for this chunk
+
+
 def main():
     input_path, output_path = sys.argv[1], sys.argv[2]
-    api_key = os.environ["GEMINI_API_KEY"]
 
-    import google.generativeai as genai
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-3.5-flash")
+    api_keys = load_api_keys()
+    rotator = KeyRotator(api_keys, MODEL_NAME)
 
     all_blocks = parse_srt_blocks(input_path)
     if not all_blocks:
         print("No subtitle blocks found.", file=sys.stderr)
         sys.exit(1)
+
+    print(f"Total blocks: {len(all_blocks)} | BATCH_SIZE: {BATCH_SIZE} | "
+          f"Calls needed: {-(-len(all_blocks) // BATCH_SIZE)}", file=sys.stderr)
 
     translated_by_index = {}
 
@@ -133,27 +218,16 @@ def main():
         print(f"Translating blocks {start + 1}-{start + len(chunk)} of {len(all_blocks)}...",
               file=sys.stderr)
 
-        translated_chunk = []
-        attempt = 0
-        while attempt < 3:
-            try:
-                translated_chunk = translate_chunk(model, chunk)
-                if len(translated_chunk) == len(chunk):
-                    break
-                print(f"  Block count mismatch (got {len(translated_chunk)}, expected {len(chunk)}), retrying...",
-                      file=sys.stderr)
-            except Exception as e:
-                print(f"  Batch failed (attempt {attempt + 1}): {e}", file=sys.stderr)
-            attempt += 1
-            time.sleep(3)
+        translated_chunk = rotator.translate_with_rotation(chunk)
 
-        if len(translated_chunk) == len(chunk):
+        if translated_chunk and len(translated_chunk) == len(chunk):
             for idx, translated_block in zip(expected_indexes, translated_chunk):
                 translated_by_index[idx] = translated_block
         else:
             # Fallback: keep original English blocks for this chunk rather
             # than losing/misaligning subtitles.
-            print(f"  WARNING: keeping original English text for blocks {start + 1}-{start + len(chunk)}",
+            print(f"  WARNING: all keys exhausted or persistent mismatch - "
+                  f"keeping original text for blocks {start + 1}-{start + len(chunk)}",
                   file=sys.stderr)
             for idx, original_block in zip(expected_indexes, chunk):
                 translated_by_index[idx] = original_block

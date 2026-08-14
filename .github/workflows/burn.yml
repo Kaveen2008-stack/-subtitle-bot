@@ -112,9 +112,9 @@ jobs:
             && ./scripts/report_status.sh "translate" "success" \
             || { ./scripts/report_status.sh "translate" "failed"; exit 1; }
 
-      - name: Use SRT as-is (already Sinhala)
+      - name: Clean manual Sinhala sub (strip site credits/font tags)
         if: inputs.sub_type != 'english' && inputs.sub_format != 'ass'
-        run: cp subs_raw.srt subs.srt
+        run: python scripts/clean_srt.py subs_raw.srt subs.srt
 
       - name: Use ASS as-is (skip translation/conversion)
         if: inputs.sub_format == 'ass'

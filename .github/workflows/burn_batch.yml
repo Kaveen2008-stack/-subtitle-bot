@@ -194,7 +194,7 @@ jobs:
             if [ "$SUB_TYPE" == "english" ]; then
               python scripts/translate.py "subs_raw_ep${EP_NUM}.srt" "subs_ep${EP_NUM}.srt"
             else
-              cp "subs_raw_ep${EP_NUM}.srt" "subs_ep${EP_NUM}.srt"
+              python scripts/clean_srt.py "subs_raw_ep${EP_NUM}.srt" "subs_ep${EP_NUM}.srt"
             fi
 
             cp "$EP_PATH" "input_video_ep${EP_NUM}.mp4" || cp "$EP_PATH" "input_video_ep${EP_NUM}.mkv"

@@ -163,6 +163,7 @@ jobs:
               s = rows[0]
               out = os.environ['GITHUB_ENV']
               with open(out, 'a') as f:
+                  f.write(f\"RENDER_RESOLUTION_HEIGHT={s.get('resolution_height', 720)}\n\")
                   f.write(f\"RENDER_FONT_SIZE={s.get('font_size', 42)}\n\")
                   f.write(f\"RENDER_MARGIN_V={s.get('margin_v', 14)}\n\")
                   f.write(f\"RENDER_OUTLINE={s.get('outline_width', 1)}\n\")
@@ -176,6 +177,7 @@ jobs:
               print(f'WARNING: could not fetch render settings ({e}), using defaults', file=sys.stderr)
               out = os.environ['GITHUB_ENV']
               with open(out, 'a') as f:
+                  f.write('RENDER_RESOLUTION_HEIGHT=720\n')
                   f.write('RENDER_FONT_SIZE=42\n')
                   f.write('RENDER_MARGIN_V=14\n')
                   f.write('RENDER_OUTLINE=1\n')
@@ -220,7 +222,7 @@ jobs:
           WATERMARK_TEXT="${RENDER_WATERMARK_TEXT}"
           FONT_DIR=$(pwd)/sinhala-font
 
-          FILTER="${CROP_FILTER}ass=subs.ass:fontsdir=${FONT_DIR},"
+          FILTER="${CROP_FILTER}scale=-2:${RENDER_RESOLUTION_HEIGHT},ass=subs.ass:fontsdir=${FONT_DIR},"
           FILTER="${FILTER}drawtext=text='${WATERMARK_TEXT}':fontfile=${SINHALA_FONT_PATH}:fontsize=${RENDER_WATERMARK_FONTSIZE}:fontcolor=white@${RENDER_WATERMARK_OPACITY}:borderw=1:bordercolor=black@0.5:x=w-tw-16:y=h-th-16"
 
           if ! ffmpeg -y -i input_video.mp4 \

@@ -1,0 +1,363 @@
+name: Burn Season (Zip Archive - Auto-Match + Matrix Parallel)
+
+on:
+  workflow_dispatch:
+    inputs:
+      archive_url:
+        description: "Direct URL to a zip/7z archive containing season video files"
+        required: true
+        type: string
+      srt_archive_url:
+        description: "Direct URL to a zip archive containing matching .srt files (filenames must contain SxxExx like the videos)"
+        required: true
+        type: string
+      sub_type:
+        description: "english or sinhala"
+        required: true
+        type: string
+      chat_id:
+        description: "Telegram chat_id to notify when done"
+        required: true
+        type: string
+      tmdb_id:
+        description: "TMDB show ID"
+        required: true
+        type: string
+      season_number:
+        description: "Season number"
+        required: true
+        type: string
+
+concurrency:
+  group: burn-season-${{ inputs.chat_id }}-${{ inputs.tmdb_id }}-${{ inputs.season_number }}
+  cancel-in-progress: false
+
+jobs:
+  # ============================================================
+  # JOB 1: Runs ONCE. Downloads both archives, extracts them,
+  # matches each video to its subtitle by SxxExx in the filename,
+  # uploads each raw video to Pixeldrain (to get a stable URL for
+  # the later matrix jobs), and uploads each raw srt as a small
+  # artifact. Outputs a JSON list consumed by the matrix jobs below.
+  # ============================================================
+  extract-and-plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      episodes: ${{ steps.plan.outputs.episodes }}
+    steps:
+      - name: Checkout repo (for scripts)
+        uses: actions/checkout@v4
+
+      - name: Install archive tools
+        run: sudo apt-get update -qq && sudo apt-get install -y p7zip-full unzip
+
+      - name: Set up Python deps
+        run: pip install --quiet requests
+
+      - name: Download + extract video archive
+        run: |
+          set -e
+          curl -f -L -A "Mozilla/5.0" -o video_archive "${{ inputs.archive_url }}"
+          mkdir -p videos_extracted
+          FILE_TYPE=$(file -b video_archive)
+          if echo "$FILE_TYPE" | grep -qi "7-zip"; then
+            7z x video_archive -ovideos_extracted -y
+          elif echo "$FILE_TYPE" | grep -qi "zip"; then
+            unzip -o video_archive -d videos_extracted
+          else
+            7z x video_archive -ovideos_extracted -y
+          fi
+
+      - name: Download + extract subtitle archive
+        run: |
+          set -e
+          curl -f -L -A "Mozilla/5.0" -o srt_archive "${{ inputs.srt_archive_url }}"
+          mkdir -p srts_extracted
+          FILE_TYPE=$(file -b srt_archive)
+          if echo "$FILE_TYPE" | grep -qi "7-zip"; then
+            7z x srt_archive -osrts_extracted -y
+          elif echo "$FILE_TYPE" | grep -qi "zip"; then
+            unzip -o srt_archive -d srts_extracted
+          else
+            7z x srt_archive -osrts_extracted -y
+          fi
+
+      - name: Match episodes (video <-> srt by SxxExx in filename)
+        id: match
+        run: |
+          set -e
+          python3 scripts/match_episodes.py videos_extracted srts_extracted matched_episodes.json
+          cat matched_episodes.json
+
+      - name: Upload each raw video to Pixeldrain (to get stable per-episode URLs)
+        id: plan
+        env:
+          PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+        run: |
+          set -e
+          python3 scripts/plan_season_uploads.py matched_episodes.json episode_plan.json
+          echo "episodes<<EOF" >> "$GITHUB_OUTPUT"
+          cat episode_plan.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "--- Planned episodes ---"
+          cat episode_plan.json
+
+      - name: Upload matched srt files as artifacts (one per episode)
+        run: |
+          set -e
+          python3 -c "
+          import json, shutil, os
+          with open('matched_episodes.json') as f:
+              episodes = json.load(f)
+          os.makedirs('srt_by_episode', exist_ok=True)
+          for ep in episodes:
+              shutil.copy(ep['srt_path'], f\"srt_by_episode/ep{ep['episode_number']}.srt\")
+          "
+      - uses: actions/upload-artifact@v4
+        with:
+          name: season-srts
+          path: srt_by_episode/
+          retention-days: 1
+
+  # ============================================================
+  # JOB 2: Matrix over episodes (parallel). Cleans + translates
+  # (Gemini, once per episode - not duplicated per quality) +
+  # converts to ASS. One artifact per episode.
+  # ============================================================
+  prepare-subs:
+    needs: extract-and-plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        episode: ${{ fromJson(needs.extract-and-plan.outputs.episodes) }}
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - name: Checkout repo (for scripts)
+        uses: actions/checkout@v4
+
+      - name: Install Sinhala font
+        run: |
+          set -e
+          mkdir -p sinhala-font
+          curl -f -L -o sinhala-font/NotoSansSinhala-Bold.ttf \
+            "https://github.com/google/fonts/raw/main/ofl/notosanssinhala/NotoSansSinhala%5Bwdth%2Cwght%5D.ttf"
+          echo "SINHALA_FONT_NAME=Noto Sans Sinhala" >> "$GITHUB_ENV"
+
+      - name: Set up Python deps
+        run: pip install --quiet google-generativeai requests
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: season-srts
+          path: srt_by_episode
+
+      - name: Clean subtitle
+        run: python scripts/clean_srt.py "srt_by_episode/ep${{ matrix.episode.episode_number }}.srt" subs_cleaned.srt
+
+      - name: Translate to Sinhala (only if needed)
+        if: inputs.sub_type == 'english'
+        env:
+          GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
+          GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
+          GEMINI_API_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
+        run: python scripts/translate.py subs_cleaned.srt subs.srt
+
+      - name: Use cleaned sub as-is (already Sinhala)
+        if: inputs.sub_type != 'english'
+        run: cp subs_cleaned.srt subs.srt
+
+      - name: Fetch render settings
+        run: |
+          set -e
+          RESULT=$(curl -s "${SUPABASE_URL}/rest/v1/render_settings?quality=eq.1080p&select=*" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}")
+          python3 -c "
+          import json, sys, os
+          try:
+              rows = json.loads(sys.argv[1]); s = rows[0] if rows else {}
+          except Exception:
+              s = {}
+          out = os.environ['GITHUB_ENV']
+          with open(out, 'a') as f:
+              f.write(f\"RENDER_FONT_SIZE={s.get('font_size', 42)}\n\")
+              f.write(f\"RENDER_MARGIN_V={s.get('margin_v', 14)}\n\")
+              f.write(f\"RENDER_OUTLINE={s.get('outline_width', 1)}\n\")
+          " "$RESULT"
+
+      - name: Convert SRT to ASS
+        run: |
+          python scripts/srt_to_ass.py subs.srt subs.ass "$SINHALA_FONT_NAME" \
+            --font-size "$RENDER_FONT_SIZE" --margin-v "$RENDER_MARGIN_V" --outline "$RENDER_OUTLINE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: subs-ep${{ matrix.episode.episode_number }}
+          path: subs.ass
+          retention-days: 1
+
+  # ============================================================
+  # JOB 3: Matrix over episode x quality (built-in cross product).
+  # Runs TRUE PARALLEL across separate runners, capped at
+  # max-parallel: 10 concurrent jobs to be gentle on Pixeldrain/
+  # the video host.
+  # ============================================================
+  burn:
+    needs: [extract-and-plan, prepare-subs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        episode: ${{ fromJson(needs.extract-and-plan.outputs.episodes) }}
+        quality: [1080p, 720p, 480p]
+        include:
+          - quality: 1080p
+            scale: "1920:-2"
+          - quality: 720p
+            scale: "1280:-2"
+          - quality: 480p
+            scale: "854:-2"
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ inputs.chat_id }}
+    steps:
+      - name: Checkout repo (for scripts)
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y ffmpeg
+
+      - name: Set up Python deps
+        run: pip install --quiet requests Pillow
+
+      - name: Install Sinhala font
+        run: |
+          set -e
+          mkdir -p sinhala-font
+          curl -f -L -o sinhala-font/NotoSansSinhala-Bold.ttf \
+            "https://github.com/google/fonts/raw/main/ofl/notosanssinhala/NotoSansSinhala%5Bwdth%2Cwght%5D.ttf"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: subs-ep${{ matrix.episode.episode_number }}
+
+      - name: Fetch render settings for ${{ matrix.quality }}
+        run: |
+          set -e
+          RESULT=$(curl -s "${SUPABASE_URL}/rest/v1/render_settings?quality=eq.${{ matrix.quality }}&select=*" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}")
+          python3 -c "
+          import json, sys, os
+          try:
+              rows = json.loads(sys.argv[1]); s = rows[0] if rows else {}
+          except Exception:
+              s = {}
+          out = os.environ['GITHUB_ENV']
+          with open(out, 'a') as f:
+              f.write(f\"RENDER_WATERMARK_TEXT={s.get('watermark_text', 'OnlyKSub')}\n\")
+              f.write(f\"RENDER_WATERMARK_OPACITY={s.get('watermark_opacity', 0.6)}\n\")
+              f.write(f\"RENDER_WATERMARK_FONTSIZE={s.get('watermark_fontsize', 16)}\n\")
+              f.write(f\"RENDER_CRF={s.get('crf', 23)}\n\")
+              f.write(f\"RENDER_AUDIO_BITRATE={s.get('audio_bitrate', '128k')}\n\")
+          " "$RESULT"
+
+      - name: Download episode video
+        run: |
+          set -e
+          curl -f -L -A "Mozilla/5.0" -o input_video.mp4 "${{ matrix.episode.video_url }}"
+
+      - name: Detect and remove black bars
+        run: |
+          set -e
+          CROP=$(python3 scripts/detect_crop.py input_video.mp4 --threshold 24 --samples 30 | grep "^crop=" || true)
+          if [ -z "$CROP" ]; then
+            echo "CROP_FILTER=" >> "$GITHUB_ENV"
+          else
+            echo "CROP_FILTER=${CROP}," >> "$GITHUB_ENV"
+          fi
+
+      - name: Burn subtitles + watermark (ep${{ matrix.episode.episode_number }}, ${{ matrix.quality }})
+        run: |
+          set -e
+          FONT_DIR=$(pwd)/sinhala-font
+          FONT_PATH="${FONT_DIR}/NotoSansSinhala-Bold.ttf"
+          FILTER="${CROP_FILTER}ass=subs.ass:fontsdir=${FONT_DIR},scale=${{ matrix.scale }},"
+          FILTER="${FILTER}drawtext=text='${RENDER_WATERMARK_TEXT}':fontfile=${FONT_PATH}:fontsize=${RENDER_WATERMARK_FONTSIZE}:fontcolor=white@${RENDER_WATERMARK_OPACITY}:borderw=1:bordercolor=black@0.5:x=w-tw-16:y=h-th-16"
+          ffmpeg -y -i input_video.mp4 -vf "$FILTER" \
+            -c:v libx264 -preset veryfast -crf "${RENDER_CRF}" -pix_fmt yuv420p \
+            -c:a aac -b:a "${RENDER_AUDIO_BITRATE}" -movflags +faststart \
+            "output.mp4"
+
+      - name: Upload to Pixeldrain
+        id: pixeldrain
+        env:
+          PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+        run: |
+          set -e
+          python scripts/upload_pixeldrain.py output.mp4
+          echo "link=$(cat pixeldrain_link.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Notify website (webhook)
+        continue-on-error: true
+        env:
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          LINK: ${{ steps.pixeldrain.outputs.link }}
+        run: |
+          curl -s -X POST "https://onlyksub.vercel.app/api/webhook-hardcode-complete" \
+            -H "Content-Type: application/json" \
+            -H "x-webhook-secret: ${WEBHOOK_SECRET}" \
+            -d "{
+              \"tmdb_id\": ${{ inputs.tmdb_id }},
+              \"season_number\": ${{ inputs.season_number }},
+              \"episode_number\": ${{ matrix.episode.episode_number }},
+              \"pixeldrain_download_url\": \"${LINK}\",
+              \"quality\": \"${{ matrix.quality }}\"
+            }"
+
+      - name: Notify on Telegram
+        if: always()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ inputs.chat_id }}
+          LINK: ${{ steps.pixeldrain.outputs.link }}
+        run: |
+          if [ -n "$LINK" ]; then
+            TEXT="✅ Ep${{ matrix.episode.episode_number }} ${{ matrix.quality }} done! 📥 ${LINK}"
+          else
+            TEXT="❌ Ep${{ matrix.episode.episode_number }} ${{ matrix.quality }} failed."
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" --data-urlencode text="${TEXT}"
+
+  # ============================================================
+  # JOB 4: Final summary once everything finishes.
+  # ============================================================
+  finalize:
+    needs: burn
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify season complete
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ inputs.chat_id }}
+        run: |
+          STATUS="🎉 Season ${{ inputs.season_number }} batch complete!"
+          if [ "${{ needs.burn.result }}" != "success" ]; then
+            STATUS="⚠️ Season ${{ inputs.season_number }} batch finished with some failures - check Actions log."
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" --data-urlencode text="$STATUS"

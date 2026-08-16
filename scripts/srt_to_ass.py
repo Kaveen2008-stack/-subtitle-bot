@@ -43,11 +43,14 @@ def clean_line(text):
 
 
 def srt_time_to_ass(t):
-    h, m, rest = t.split(":")
-    rest = rest.replace(".", ",")  # normalize period to comma if needed
-    s, ms = rest.split(",")
+    t = t.strip()
+    m = re.match(r"(\d+):(\d+):(\d+)[.,](\d+)", t)
+    if not m:
+        raise ValueError(f"Cannot parse timestamp: {t!r}")
+    h, mnt, s, ms = m.groups()
+    ms = (ms + "000")[:3]  # pad/truncate to exactly 3 digits
     centisec = int(ms) // 10
-    return f"{int(h)}:{m}:{s}.{centisec:02d}"
+    return f"{int(h)}:{mnt}:{s}.{centisec:02d}"
 
 
 def parse_srt(path):

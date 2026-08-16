@@ -44,6 +44,7 @@ def clean_line(text):
 
 def srt_time_to_ass(t):
     h, m, rest = t.split(":")
+    rest = rest.replace(".", ",")  # normalize period to comma if needed
     s, ms = rest.split(",")
     centisec = int(ms) // 10
     return f"{int(h)}:{m}:{s}.{centisec:02d}"

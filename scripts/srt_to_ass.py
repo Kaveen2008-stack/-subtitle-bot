@@ -44,10 +44,31 @@ def clean_line(text):
 
 def srt_time_to_ass(t):
     t = t.strip()
-    m = re.match(r"(\d+):(\d+):(\d+)[.,](\d+)", t)
-    if not m:
-        raise ValueError(f"Cannot parse timestamp: {t!r}")
-    h, mnt, s, ms = m.groups()
+
+    # Standard: H:MM:SS,mmm or H:MM:SS.mmm
+    m = re.match(r"^(\d+):(\d+):(\d+)[.,](\d+)$", t)
+    if m:
+        h, mnt, s, ms = m.groups()
+    else:
+        # Some fan-sub sources (e.g. certain sub.lk-style SRTs) drop the
+        # hours field and/or use ':' instead of ',' before milliseconds,
+        # e.g. "00:43:816" meaning MM:SS:mmm rather than H:MM:SS. Since a
+        # valid seconds value is always < 60, three colon-separated groups
+        # where the last one is >= 60 (or exactly 3 digits, i.e. clearly a
+        # millisecond value) can only be MM:SS:mmm with hours omitted.
+        m = re.match(r"^(\d+):(\d+):(\d+)$", t)
+        if m:
+            mnt, s, ms = m.groups()
+            h = "0"
+        else:
+            # MM:SS,mmm / MM:SS.mmm with no hours field at all
+            m = re.match(r"^(\d+):(\d+)[.,](\d+)$", t)
+            if m:
+                mnt, s, ms = m.groups()
+                h = "0"
+            else:
+                raise ValueError(f"Cannot parse timestamp: {t!r}")
+
     ms = (ms + "000")[:3]  # pad/truncate to exactly 3 digits
     centisec = int(ms) // 10
     return f"{int(h)}:{mnt}:{s}.{centisec:02d}"
@@ -58,16 +79,29 @@ def parse_srt(path):
         content = f.read()
     blocks = re.split(r"\n\s*\n", content.strip())
     cues = []
+    skipped = 0
     for block in blocks:
         lines = block.strip().split("\n")
         if len(lines) >= 3:
             timing = lines[1]
+            if "-->" not in timing:
+                skipped += 1
+                continue
             start_str, end_str = [x.strip() for x in timing.split("-->")]
-            start = srt_time_to_ass(start_str)
-            end = srt_time_to_ass(end_str)
+            try:
+                start = srt_time_to_ass(start_str)
+                end = srt_time_to_ass(end_str)
+            except ValueError as e:
+                # Don't let one malformed cue (bad source timestamp) kill
+                # the whole episode's subtitle burn - skip it and keep going.
+                print(f"WARNING: skipping cue with unparseable timing ({e}): {timing!r}", file=sys.stderr)
+                skipped += 1
+                continue
             text_lines = [clean_line(l) for l in lines[2:]]
             text = "\\N".join(text_lines)  # ASS line-break token
             cues.append((start, end, text))
+    if skipped:
+        print(f"WARNING: skipped {skipped} cue(s) with malformed/missing timing", file=sys.stderr)
     return cues
 
 

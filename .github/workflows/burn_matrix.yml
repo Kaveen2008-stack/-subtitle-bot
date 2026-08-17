@@ -66,7 +66,7 @@ jobs:
         run: |
           set -e
           mkdir -p sinhala-font
-          curl -f -L -o sinhala-font/NotoSansSinhala-Bold.ttf \
+          curl -f -L --retry 5 --retry-delay 3 --retry-connrefused -o sinhala-font/NotoSansSinhala-Bold.ttf \
             "https://github.com/google/fonts/raw/main/ofl/notosanssinhala/NotoSansSinhala%5Bwdth%2Cwght%5D.ttf"
           if ! file sinhala-font/NotoSansSinhala-Bold.ttf | grep -qE "TrueType|OpenType"; then
             echo "ERROR: Font download failed or file is not a valid font"

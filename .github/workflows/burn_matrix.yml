@@ -65,11 +65,11 @@ jobs:
       - name: Install Sinhala font (Noto Sans Sinhala)
         run: |
           set -e
+          pip install --quiet fonttools
           mkdir -p sinhala-font
-          curl -f -L --retry 5 --retry-delay 3 --retry-connrefused -o sinhala-font/NotoSansSinhala-Bold.ttf \
-            "https://github.com/google/fonts/raw/main/ofl/notosanssinhala/NotoSansSinhala%5Bwdth%2Cwght%5D.ttf"
+          python scripts/install_sinhala_font.py sinhala-font
           if ! file sinhala-font/NotoSansSinhala-Bold.ttf | grep -qE "TrueType|OpenType"; then
-            echo "ERROR: Font download failed or file is not a valid font"
+            echo "ERROR: Font generation failed or file is not a valid font"
             exit 1
           fi
           echo "SINHALA_FONT_NAME=Noto Sans Sinhala" >> "$GITHUB_ENV"

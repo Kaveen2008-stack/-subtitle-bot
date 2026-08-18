@@ -1,4 +1,4 @@
-name: Burn Season (Zip Archive - Auto-Match + Matrix Parallel)
+name: Burn Season (Individual Subs + Confirm-Before-Burn + Matrix Parallel)
 
 on:
   workflow_dispatch:
@@ -7,8 +7,8 @@ on:
         description: "Direct URL to a zip/7z archive containing season video files"
         required: true
         type: string
-      srt_archive_url:
-        description: "Direct URL to a zip archive containing matching .srt files (filenames must contain SxxExx like the videos)"
+      srt_files_json:
+        description: 'JSON array: [{"episode_number":1,"srt_url":"https://gist..."}, ...]'
         required: true
         type: string
       sub_type:
@@ -34,11 +34,12 @@ concurrency:
 
 jobs:
   # ============================================================
-  # JOB 1: Runs ONCE. Downloads both archives, extracts them,
-  # matches each video to its subtitle by SxxExx in the filename,
-  # uploads each raw video to Pixeldrain (to get a stable URL for
-  # the later matrix jobs), and uploads each raw srt as a small
-  # artifact. Outputs a JSON list consumed by the matrix jobs below.
+  # JOB 1: Runs ONCE. Validates the archive URL, extracts it,
+  # downloads each individually-provided srt, matches videos to
+  # the episode numbers that actually have subtitles, and uploads
+  # each raw video to Pixeldrain to get a stable URL. Sends a
+  # match report to Telegram so it can be reviewed BEFORE the
+  # burn job proceeds (see confirm-before-burn below).
   # ============================================================
   extract-and-plan:
     runs-on: ubuntu-latest
@@ -55,6 +56,16 @@ jobs:
       - name: Set up Python deps
         run: pip install --quiet requests
 
+      - name: Validate archive URL is reachable
+        run: |
+          set -e
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -L -A "Mozilla/5.0" "${{ inputs.archive_url }}")
+          echo "Archive URL status: $STATUS"
+          if [ "$STATUS" -ge 400 ]; then
+            echo "ERROR: archive_url is not reachable (HTTP $STATUS). Aborting before wasting minutes."
+            exit 1
+          fi
+
       - name: Download + extract video archive
         run: |
           set -e
@@ -68,29 +79,44 @@ jobs:
           else
             7z x video_archive -ovideos_extracted -y
           fi
+          echo "--- Extracted files ---"
+          find videos_extracted -type f
 
-      - name: Download + extract subtitle archive
+      - name: Download individually-provided srt files
         run: |
           set -e
-          curl -f -L -A "Mozilla/5.0" -o srt_archive "${{ inputs.srt_archive_url }}"
-          mkdir -p srts_extracted
-          FILE_TYPE=$(file -b srt_archive)
-          if echo "$FILE_TYPE" | grep -qi "7-zip"; then
-            7z x srt_archive -osrts_extracted -y
-          elif echo "$FILE_TYPE" | grep -qi "zip"; then
-            unzip -o srt_archive -d srts_extracted
-          else
-            7z x srt_archive -osrts_extracted -y
-          fi
+          python3 -c "
+          import json, os
+          srt_list = json.loads('''${{ inputs.srt_files_json }}''')
+          os.makedirs('srt_by_episode', exist_ok=True)
+          episodes = [str(item['episode_number']) for item in srt_list]
+          with open('wanted_episodes.txt', 'w') as f:
+              f.write(','.join(episodes))
+          with open('srt_list.json', 'w') as f:
+              json.dump(srt_list, f)
+          print(f'{len(srt_list)} subtitle entries received')
+          "
+          while IFS= read -r line; do
+            EP=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['episode_number'])")
+            URL=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['srt_url'])")
+            echo "Downloading srt for episode $EP..."
+            curl -f -L -o "srt_by_episode/ep${EP}.srt" "$URL"
+          done < <(python3 -c "
+          import json
+          with open('srt_list.json') as f:
+              for item in json.load(f):
+                  print(json.dumps(item))
+          ")
+          echo "--- Downloaded srt files ---"
+          ls -la srt_by_episode/
 
-      - name: Match episodes (video <-> srt by SxxExx in filename)
-        id: match
+      - name: Match videos to episodes that have subtitles
         run: |
           set -e
-          python3 scripts/match_episodes.py videos_extracted srts_extracted matched_episodes.json
-          cat matched_episodes.json
+          WANTED=$(cat wanted_episodes.txt)
+          python3 scripts/match_videos_only.py videos_extracted "$WANTED" matched_episodes.json
 
-      - name: Upload each raw video to Pixeldrain (to get stable per-episode URLs)
+      - name: Upload each matched raw video to Pixeldrain
         id: plan
         env:
           PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
@@ -100,33 +126,47 @@ jobs:
           echo "episodes<<EOF" >> "$GITHUB_OUTPUT"
           cat episode_plan.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
-          echo "--- Planned episodes ---"
+          echo "--- Final planned episodes (video + srt both confirmed) ---"
           cat episode_plan.json
 
-      - name: Upload matched srt files as artifacts (one per episode)
-        run: |
-          set -e
-          python3 -c "
-          import json, shutil, os
-          with open('matched_episodes.json') as f:
-              episodes = json.load(f)
-          os.makedirs('srt_by_episode', exist_ok=True)
-          for ep in episodes:
-              shutil.copy(ep['srt_path'], f\"srt_by_episode/ep{ep['episode_number']}.srt\")
-          "
       - uses: actions/upload-artifact@v4
         with:
           name: season-srts
           path: srt_by_episode/
           retention-days: 1
 
+      - name: Send match report to Telegram for review
+        if: always()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ inputs.chat_id }}
+        run: |
+          COUNT=$(python3 -c "import json; print(len(json.load(open('episode_plan.json'))))" 2>/dev/null || echo "0")
+          TEXT="Season plan ready: ${COUNT} episode(s) matched (video+srt confirmed). Go to GitHub Actions to REVIEW the matched list and APPROVE before burning starts."
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" --data-urlencode text="${TEXT}"
+
+  # ============================================================
+  # JOB 1.5: MANUAL APPROVAL GATE. Requires a human to click
+  # "Approve" in GitHub Actions (Environment: season-approval,
+  # configured with required reviewers in repo Settings).
+  # Review extract-and-plan's log (the match report) first.
+  # ============================================================
+  confirm-before-burn:
+    needs: extract-and-plan
+    runs-on: ubuntu-latest
+    environment: season-approval
+    steps:
+      - name: Approved - proceeding to burn
+        run: echo "Match list approved. Proceeding to burn planned episodes."
+
   # ============================================================
   # JOB 2: Matrix over episodes (parallel). Cleans + translates
   # (Gemini, once per episode - not duplicated per quality) +
-  # converts to ASS. One artifact per episode.
+  # converts to ASS. Only runs after confirm-before-burn.
   # ============================================================
   prepare-subs:
-    needs: extract-and-plan
+    needs: [extract-and-plan, confirm-before-burn]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -211,11 +251,10 @@ jobs:
   # ============================================================
   # JOB 3: Matrix over episode x quality (built-in cross product).
   # Runs TRUE PARALLEL across separate runners, capped at
-  # max-parallel: 10 concurrent jobs to be gentle on Pixeldrain/
-  # the video host.
+  # max-parallel: 10 concurrent jobs. Only runs after approval.
   # ============================================================
   burn:
-    needs: [extract-and-plan, prepare-subs]
+    needs: [extract-and-plan, confirm-before-burn, prepare-subs]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
@@ -377,12 +416,12 @@ jobs:
           VOE_LINK: ${{ steps.voe.outputs.link }}
         run: |
           if [ -n "$LINK" ]; then
-            TEXT="✅ Ep${{ matrix.episode.episode_number }} ${{ matrix.quality }} done! 📥 ${LINK}"
+            TEXT="Ep${{ matrix.episode.episode_number }} ${{ matrix.quality }} done! ${LINK}"
             if [ -n "$VOE_LINK" ]; then
-              TEXT="${TEXT}"$'\n'"🎬 VOE: ${VOE_LINK}"
+              TEXT="${TEXT}"$'\n'"VOE: ${VOE_LINK}"
             fi
           else
-            TEXT="❌ Ep${{ matrix.episode.episode_number }} ${{ matrix.quality }} failed."
+            TEXT="Ep${{ matrix.episode.episode_number }} ${{ matrix.quality }} failed."
           fi
           curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             -d chat_id="${CHAT_ID}" --data-urlencode text="${TEXT}"
@@ -400,9 +439,9 @@ jobs:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ inputs.chat_id }}
         run: |
-          STATUS="🎉 Season ${{ inputs.season_number }} batch complete!"
+          STATUS="Season ${{ inputs.season_number }} batch complete!"
           if [ "${{ needs.burn.result }}" != "success" ]; then
-            STATUS="⚠️ Season ${{ inputs.season_number }} batch finished with some failures - check Actions log."
+            STATUS="Season ${{ inputs.season_number }} batch finished with some failures - check Actions log."
           fi
           curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             -d chat_id="${CHAT_ID}" --data-urlencode text="$STATUS"

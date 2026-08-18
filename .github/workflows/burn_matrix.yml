@@ -277,12 +277,48 @@ jobs:
             exit 1
           fi
 
+      - name: Upload to VOE.sx (1080p only)
+        id: voe
+        if: matrix.quality == '1080p'
+        continue-on-error: true
+        env:
+          VOE_API_KEY: ${{ secrets.VOE_API_KEY }}
+          PIXELDRAIN_LINK: ${{ steps.pixeldrain.outputs.link }}
+        run: |
+          ./scripts/report_status.sh "upload_voe" "started"
+          RESPONSE=$(curl -s "https://voe.sx/api/upload/url?key=${VOE_API_KEY}&url=${PIXELDRAIN_LINK}")
+          echo "VOE upload response: $RESPONSE"
+          QUEUE_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',{}).get('queueID',''))" 2>/dev/null || echo "")
+
+          if [ -z "$QUEUE_ID" ]; then
+            echo "WARNING: VOE upload could not be queued (bad response), continuing without VOE link."
+            ./scripts/report_status.sh "upload_voe" "failed" "{\"reason\":\"no queueID in response\"}"
+            exit 0
+          fi
+
+          for i in $(seq 1 90); do
+            sleep 10
+            STATUS=$(curl -s "https://voe.sx/api/upload/url/list?key=${VOE_API_KEY}&id=${QUEUE_ID}")
+            PERCENT=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['list']['data'][0].get('percent', 0))" 2>/dev/null || echo "0")
+            FILE_CODE=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['list']['data'][0].get('file_code', ''))" 2>/dev/null || echo "")
+            echo "Attempt $i: percent=$PERCENT"
+            if [ "$PERCENT" = "100" ] && [ -n "$FILE_CODE" ]; then
+              echo "link=https://voe.sx/e/${FILE_CODE}" >> "$GITHUB_OUTPUT"
+              echo "VOE embed link ready: https://voe.sx/e/${FILE_CODE}"
+              ./scripts/report_status.sh "upload_voe" "success" "{\"link\":\"https://voe.sx/e/${FILE_CODE}\"}"
+              exit 0
+            fi
+          done
+          echo "WARNING: VOE processing timed out, continuing without VOE link."
+          ./scripts/report_status.sh "upload_voe" "failed" '{"reason":"timed out"}'
+
       - name: Notify website (webhook) for ${{ matrix.quality }}
         if: always()
         continue-on-error: true
         env:
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
           LINK: ${{ steps.pixeldrain.outputs.link }}
+          VOE_LINK: ${{ steps.voe.outputs.link }}
         run: |
           if [ -z "$LINK" ]; then exit 0; fi
           curl -s -X POST "https://onlyksub.vercel.app/api/webhook-hardcode-complete" \
@@ -293,6 +329,7 @@ jobs:
               \"season_number\": ${{ inputs.season_number }},
               \"episode_number\": ${{ inputs.episode_number }},
               \"pixeldrain_download_url\": \"${LINK}\",
+              \"voe_embed_url\": \"${VOE_LINK}\",
               \"quality\": \"${{ matrix.quality }}\"
             }"
 
@@ -302,9 +339,13 @@ jobs:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ inputs.chat_id }}
           LINK: ${{ steps.pixeldrain.outputs.link }}
+          VOE_LINK: ${{ steps.voe.outputs.link }}
         run: |
           if [ -n "$LINK" ]; then
             TEXT="✅ ${{ matrix.quality }} done! 📥 ${LINK}"
+            if [ -n "$VOE_LINK" ]; then
+              TEXT="${TEXT}"$'\n'"🎬 VOE: ${VOE_LINK}"
+            fi
           else
             TEXT="❌ ${{ matrix.quality }} failed. Check the GitHub Actions log."
           fi

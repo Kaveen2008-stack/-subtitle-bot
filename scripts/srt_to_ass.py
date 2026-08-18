@@ -50,16 +50,26 @@ def srt_time_to_ass(t):
     if m:
         h, mnt, s, ms = m.groups()
     else:
-        # Some fan-sub sources (e.g. certain sub.lk-style SRTs) drop the
-        # hours field and/or use ':' instead of ',' before milliseconds,
-        # e.g. "00:43:816" meaning MM:SS:mmm rather than H:MM:SS. Since a
-        # valid seconds value is always < 60, three colon-separated groups
-        # where the last one is >= 60 (or exactly 3 digits, i.e. clearly a
-        # millisecond value) can only be MM:SS:mmm with hours omitted.
         m = re.match(r"^(\d+):(\d+):(\d+)$", t)
         if m:
-            mnt, s, ms = m.groups()
-            h = "0"
+            g1, g2, g3 = m.groups()
+            # Ambiguous: three colon-separated groups with no '.'/',' could
+            # mean either "H:MM:SS" (ms simply omitted - a normal, common
+            # SRT variant) or "MM:SS:mmm" (hours omitted, ':' used instead
+            # of ',' before ms - seen in some fan-sub sources). A real
+            # seconds value is always 0-59, so only treat the last group as
+            # milliseconds when it couldn't possibly be seconds (>=60) or is
+            # written with the classic 3-digit ms width AND the middle
+            # group is itself a valid 0-59 "seconds" value too small to be
+            # minutes-with-omitted-ms in a believable way. Otherwise assume
+            # the far more common case: H:MM:SS with ms just missing.
+            if int(g3) >= 60:
+                # last group can't be seconds -> it's MM:SS:mmm (hours omitted)
+                mnt, s, ms = g1, g2, g3
+                h = "0"
+            else:
+                # normal H:MM:SS, milliseconds simply not present
+                h, mnt, s, ms = g1, g2, g3, "0"
         else:
             # MM:SS,mmm / MM:SS.mmm with no hours field at all
             m = re.match(r"^(\d+):(\d+)[.,](\d+)$", t)

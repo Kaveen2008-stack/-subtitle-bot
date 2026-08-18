@@ -38,8 +38,8 @@ jobs:
   # downloads each individually-provided srt, matches videos to
   # the episode numbers that actually have subtitles, and uploads
   # each raw video to Pixeldrain to get a stable URL. Sends a
-  # match report to Telegram so it can be reviewed BEFORE the
-  # burn job proceeds (see confirm-before-burn below).
+  # match report to Telegram for visibility - the workflow does
+  # NOT wait for manual approval, it proceeds straight to burning.
   # ============================================================
   extract-and-plan:
     runs-on: ubuntu-latest
@@ -69,7 +69,33 @@ jobs:
       - name: Download + extract video archive
         run: |
           set -e
-          curl -f -L -A "Mozilla/5.0" -o video_archive "${{ inputs.archive_url }}"
+          URL="${{ inputs.archive_url }}"
+          # Pixeldrain share links (pixeldrain.com/u/XXXX) serve an HTML
+          # viewer page, not the raw file - curl would silently download
+          # that small HTML page instead of the archive (this is exactly
+          # what caused "Cannot open the file as archive" on a ~4KB file).
+          # Convert to the direct file API endpoint first.
+          if echo "$URL" | grep -q "pixeldrain.com/u/"; then
+            FILE_ID=$(echo "$URL" | sed -E 's#.*pixeldrain\.com/u/([a-zA-Z0-9]+).*#\1#')
+            URL="https://pixeldrain.com/api/file/${FILE_ID}"
+          fi
+
+          curl -f -L -A "Mozilla/5.0" -e "https://pixeldrain.com/" -o video_archive "$URL"
+
+          # Sanity check: a real season archive is going to be at least a
+          # few MB. Anything tiny is almost certainly an HTML error/login
+          # page that curl downloaded instead of the actual file - fail
+          # here with a clear message instead of a confusing 7z error.
+          SIZE=$(stat -c%s video_archive)
+          if [ "$SIZE" -lt 1000000 ]; then
+            echo "ERROR: downloaded archive is only ${SIZE} bytes - this is almost"
+            echo "certainly not the real archive (likely an HTML error/login page)."
+            echo "First 500 bytes of what was downloaded:"
+            head -c 500 video_archive
+            echo ""
+            exit 1
+          fi
+
           mkdir -p videos_extracted
           FILE_TYPE=$(file -b video_archive)
           if echo "$FILE_TYPE" | grep -qi "7-zip"; then
@@ -147,26 +173,15 @@ jobs:
             -d chat_id="${CHAT_ID}" --data-urlencode text="${TEXT}"
 
   # ============================================================
-  # JOB 1.5: MANUAL APPROVAL GATE. Requires a human to click
-  # "Approve" in GitHub Actions (Environment: season-approval,
-  # configured with required reviewers in repo Settings).
-  # Review extract-and-plan's log (the match report) first.
-  # ============================================================
-  confirm-before-burn:
-    needs: extract-and-plan
-    runs-on: ubuntu-latest
-    environment: season-approval
-    steps:
-      - name: Approved - proceeding to burn
-        run: echo "Match list approved. Proceeding to burn planned episodes."
-
   # ============================================================
   # JOB 2: Matrix over episodes (parallel). Cleans + translates
   # (Gemini, once per episode - not duplicated per quality) +
-  # converts to ASS. Only runs after confirm-before-burn.
+  # converts to ASS. Runs automatically right after extract-and-plan
+  # - no manual approval step. You (the operator) are responsible
+  # for what's in the video/subtitle sources you point this at.
   # ============================================================
   prepare-subs:
-    needs: [extract-and-plan, confirm-before-burn]
+    needs: extract-and-plan
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -251,10 +266,11 @@ jobs:
   # ============================================================
   # JOB 3: Matrix over episode x quality (built-in cross product).
   # Runs TRUE PARALLEL across separate runners, capped at
-  # max-parallel: 10 concurrent jobs. Only runs after approval.
+  # max-parallel: 10 concurrent jobs. Runs automatically once prepare-subs
+  # finishes - no manual approval step.
   # ============================================================
   burn:
-    needs: [extract-and-plan, confirm-before-burn, prepare-subs]
+    needs: [extract-and-plan, prepare-subs]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
@@ -324,7 +340,12 @@ jobs:
       - name: Download episode video
         run: |
           set -e
-          curl -f -L -A "Mozilla/5.0" -o input_video.mp4 "${{ matrix.episode.video_url }}"
+          URL="${{ matrix.episode.video_url }}"
+          if echo "$URL" | grep -q "pixeldrain.com/u/"; then
+            FILE_ID=$(echo "$URL" | sed -E 's#.*pixeldrain\.com/u/([a-zA-Z0-9]+).*#\1#')
+            URL="https://pixeldrain.com/api/file/${FILE_ID}"
+          fi
+          curl -f -L -A "Mozilla/5.0" -e "https://pixeldrain.com/" -o input_video.mp4 "$URL"
 
       - name: Detect and remove black bars
         run: |

@@ -1,16 +1,17 @@
-name: Burn Subtitles Batch (Season/Archive - 3 Qualities)
+name: Burn Subtitles Batch (Per-Episode List - Matrix Parallel)
 
 on:
   workflow_dispatch:
     inputs:
-      archive_url:
-        description: "Pixeldrain archive URL (7z/zip) with all episode videos"
+      episodes_json:
+        description: 'JSON array: [{"episode_number":1,"video_url":"https://pixeldrain.com/u/xxxx","srt_url":"https://gist..."}, ...]'
         required: true
         type: string
-      srt_urls:
-        description: "Comma-separated raw .srt URLs, in episode order (ep1,ep2,ep3...)"
-        required: true
+      qualities_json:
+        description: 'JSON array of qualities to render, e.g. ["1080p","720p"]. Defaults to all 3.'
+        required: false
         type: string
+        default: '["1080p","720p","480p"]'
       sub_type:
         description: "english or sinhala"
         required: true
@@ -24,7 +25,7 @@ on:
         required: true
         type: string
       drama_name:
-        description: "Drama/show name (used to build output filenames)"
+        description: "Drama/show name (used to build output filenames + watermark)"
         required: true
         type: string
       season_number:
@@ -36,20 +37,67 @@ on:
         required: false
         type: string
         default: "srt"
+      job_id:
+        description: "Supabase job UUID (for dashboard tracking)"
+        required: false
+        type: string
+
+concurrency:
+  group: burn-batch-${{ inputs.chat_id }}-${{ inputs.tmdb_id }}-${{ inputs.season_number }}
+  cancel-in-progress: false
 
 jobs:
-  burn_batch:
+  # ============================================================
+  # JOB 1: Runs ONCE. Parses the episode list + selected qualities
+  # so both matrix jobs below can fan out on them. No archive
+  # download/extraction - each episode already has a direct URL.
+  # ============================================================
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 10
+    outputs:
+      episodes: ${{ steps.parse.outputs.episodes }}
+      qualities: ${{ steps.parse.outputs.qualities }}
+    steps:
+      - name: Parse episodes_json + qualities_json
+        id: parse
+        run: |
+          set -e
+          python3 -c "
+          import json
+          episodes = json.loads('''${{ inputs.episodes_json }}''')
+          for e in episodes:
+              assert 'episode_number' in e and 'video_url' in e and 'srt_url' in e, f'bad entry: {e}'
+          print(f'{len(episodes)} episode(s) planned')
+          "
+          echo "episodes=${{ toJson(fromJson(inputs.episodes_json)) }}" >> "$GITHUB_OUTPUT"
+          echo "qualities=${{ toJson(fromJson(inputs.qualities_json)) }}" >> "$GITHUB_OUTPUT"
+
+  # ============================================================
+  # JOB 2: Matrix over episodes (parallel, one runner each).
+  # Downloads/cleans/translates the srt (Gemini - expensive, must
+  # not be duplicated per quality) and converts to ASS once per
+  # episode. Shared by every quality job for that episode.
+  # ============================================================
+  prepare-subs:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        episode: ${{ fromJson(needs.plan.outputs.episodes) }}
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
     steps:
       - name: Checkout repo (for scripts)
         uses: actions/checkout@v4
 
-      - name: Install ffmpeg, Sinhala font (Noto Sans Sinhala), p7zip
+      - name: Install Sinhala font (Noto Sans Sinhala)
         run: |
           set -e
-          sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg p7zip-full unzip
           pip install --quiet fonttools
           mkdir -p sinhala-font
           python scripts/install_sinhala_font.py sinhala-font
@@ -57,287 +105,344 @@ jobs:
             echo "ERROR: Font generation failed or file is not a valid font"
             exit 1
           fi
-          mkdir -p /usr/share/fonts/truetype/custom
-          sudo cp sinhala-font/NotoSansSinhala-Bold.ttf /usr/share/fonts/truetype/custom/
-          sudo fc-cache -f
-          echo "SINHALA_FONT_PATH=sinhala-font/NotoSansSinhala-Bold.ttf" >> "$GITHUB_ENV"
           echo "SINHALA_FONT_NAME=Noto Sans Sinhala" >> "$GITHUB_ENV"
+          chmod +x scripts/report_status.sh
 
       - name: Set up Python deps
-        run: |
-          pip install --quiet google-generativeai google-api-python-client google-auth requests Pillow
+        run: pip install --quiet google-generativeai requests
 
-      - name: Build sanitized drama name for filenames
-        id: name
+      - name: Download subtitle file for ep${{ matrix.episode.episode_number }}
         run: |
           set -e
-          SAFE=$(echo "${{ inputs.drama_name }}" | tr ' ' '_' | tr -cd '[:alnum:]_-')
-          echo "SAFE_NAME=${SAFE}" >> "$GITHUB_ENV"
-          echo "Output basenames will be: ${SAFE}_S<season>E<ep>_<quality>.mp4"
+          EXT="${{ inputs.sub_format }}"
+          if [ -z "$EXT" ]; then EXT="srt"; fi
+          curl -f -L -o "subs_raw.${EXT}" "${{ matrix.episode.srt_url }}"
 
-      - name: Download archive
-        run: |
-          set -e
-          URL="${{ inputs.archive_url }}"
-          if echo "$URL" | grep -q "pixeldrain.com/u/"; then
-            FILE_ID=$(echo "$URL" | sed -E 's#.*pixeldrain\.com/u/([a-zA-Z0-9]+).*#\1#')
-            URL="https://pixeldrain.com/api/file/${FILE_ID}"
-          fi
-          curl -f -L -A "Mozilla/5.0" -e "https://pixeldrain.com/" -o archive_file "$URL"
-          ls -lh archive_file
-          file archive_file
+      - name: Clean subtitle (strip site credits/font tags)
+        if: inputs.sub_format != 'ass'
+        run: python scripts/clean_srt.py subs_raw.srt subs_cleaned.srt
 
-      - name: Extract archive
-        run: |
-          set -e
-          mkdir -p extracted
-          FILE_TYPE=$(file -b archive_file)
-          echo "Detected type: $FILE_TYPE"
-          if echo "$FILE_TYPE" | grep -qi "7-zip"; then
-            7z x archive_file -oextracted -y
-          elif echo "$FILE_TYPE" | grep -qi "zip"; then
-            unzip -o archive_file -d extracted
-          else
-            echo "Trying 7z as fallback (handles most archive types)"
-            7z x archive_file -oextracted -y
-          fi
-          echo "--- Extracted files ---"
-          find extracted -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" -o -iname "*.webm" \)
-
-      - name: Discover episodes and build ordered list
-        id: discover
-        run: |
-          set -e
-          python3 << 'PYEOF'
-          import os, re, json
-
-          video_files = []
-          for root, dirs, files in os.walk("extracted"):
-              for f in files:
-                  if f.lower().endswith((".mp4", ".mkv", ".avi", ".webm")):
-                      video_files.append(os.path.join(root, f))
-
-          episodes = []
-          for path in video_files:
-              filename = os.path.basename(path)
-              match = re.search(r'[Ss]\d+[Ee](\d+)', filename)
-              if match:
-                  ep_num = int(match.group(1))
-                  episodes.append({"episode": ep_num, "path": path})
-
-          episodes.sort(key=lambda x: x["episode"])
-
-          print(f"Discovered {len(episodes)} episodes:")
-          for e in episodes:
-              print(f"  Episode {e['episode']}: {e['path']}")
-
-          with open("episodes_list.json", "w") as f:
-              json.dump(episodes, f)
-          PYEOF
-          cat episodes_list.json
-
-      - name: Process episodes sequentially (burn all 3 qualities, upload, notify)
+      - name: Translate to Sinhala (only if needed)
+        if: inputs.sub_type == 'english' && inputs.sub_format != 'ass'
         env:
           GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
           GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
           GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
           GEMINI_API_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
-          GDRIVE_SA_JSON_B64: ${{ secrets.GDRIVE_SA_JSON_B64 }}
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
-          VOE_API_KEY: ${{ secrets.VOE_API_KEY }}
-          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
-          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT_ID: ${{ inputs.chat_id }}
-          TMDB_ID: ${{ inputs.tmdb_id }}
-          SEASON_NUMBER: ${{ inputs.season_number }}
-          SUB_TYPE: ${{ inputs.sub_type }}
-          SRT_URLS_RAW: ${{ inputs.srt_urls }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          ./scripts/report_status.sh "translate_ep${{ matrix.episode.episode_number }}" "started"
+          python scripts/translate.py subs_cleaned.srt subs.srt \
+            && ./scripts/report_status.sh "translate_ep${{ matrix.episode.episode_number }}" "success" \
+            || { ./scripts/report_status.sh "translate_ep${{ matrix.episode.episode_number }}" "failed"; exit 1; }
+
+      - name: Use cleaned sub as-is (already Sinhala)
+        if: inputs.sub_type != 'english' && inputs.sub_format != 'ass'
+        run: cp subs_cleaned.srt subs.srt
+
+      - name: Use ASS as-is (skip translation/conversion)
+        if: inputs.sub_format == 'ass'
+        run: cp subs_raw.ass subs.ass
+
+      - name: Fetch render settings (uses 1080p row for font/margin/outline)
         run: |
           set -e
+          RESULT=$(curl -s "${SUPABASE_URL}/rest/v1/render_settings?quality=eq.1080p&select=*" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}")
+          python3 -c "
+          import json, sys, os
+          try:
+              rows = json.loads(sys.argv[1]); s = rows[0] if rows else {}
+          except Exception:
+              s = {}
+          out = os.environ['GITHUB_ENV']
+          with open(out, 'a') as f:
+              f.write(f\"RENDER_FONT_SIZE={s.get('font_size', 42)}\n\")
+              f.write(f\"RENDER_MARGIN_V={s.get('margin_v', 14)}\n\")
+              f.write(f\"RENDER_OUTLINE={s.get('outline_width', 1)}\n\")
+          " "$RESULT"
 
-          IFS=',' read -ra SRT_ARRAY <<< "$SRT_URLS_RAW"
-          QUALITIES=("1080p" "720p" "480p")
-          declare -A SCALE_MAP=( ["1080p"]="1920:-2" ["720p"]="1280:-2" ["480p"]="854:-2" )
+      - name: Convert SRT to ASS (fixes Sinhala conjunct shaping in libass)
+        if: inputs.sub_format != 'ass'
+        run: |
+          set -e
+          python scripts/srt_to_ass.py subs.srt subs.ass "$SINHALA_FONT_NAME" \
+            --font-size "$RENDER_FONT_SIZE" --margin-v "$RENDER_MARGIN_V" --outline "$RENDER_OUTLINE"
 
-          python3 << 'PYEOF' > episode_count.txt
-          import json
-          with open("episodes_list.json") as f:
-              episodes = json.load(f)
-          print(len(episodes))
-          PYEOF
-          EP_COUNT=$(cat episode_count.txt)
-          echo "Total episodes to process: $EP_COUNT (qualities: ${QUALITIES[*]})"
+      - name: Upload subs.ass + font as per-episode shared artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-subs-ep${{ matrix.episode.episode_number }}
+          path: |
+            subs.ass
+            sinhala-font/NotoSansSinhala-Bold.ttf
+          retention-days: 1
 
-          FAILED_EPISODES=""
+  # ============================================================
+  # JOB 3: Matrix over episode x quality (built-in cross product,
+  # true parallel, capped at 10 concurrent runners). Each run
+  # downloads its own episode video + the shared subs.ass for
+  # that episode, crops+burns+encodes+uploads its own file, named
+  # <drama>_S<season>E<episode>_<quality>.mp4 with the drama name
+  # and episode burned into the watermark.
+  # ============================================================
+  burn:
+    needs: [plan, prepare-subs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        episode: ${{ fromJson(needs.plan.outputs.episodes) }}
+        quality: ${{ fromJson(needs.plan.outputs.qualities) }}
+        include:
+          - quality: 1080p
+            scale: "1920:-2"
+          - quality: 720p
+            scale: "1280:-2"
+          - quality: 480p
+            scale: "854:-2"
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ inputs.chat_id }}
+      JOB_ID: ${{ inputs.job_id }}
+    steps:
+      - name: Checkout repo (for scripts)
+        uses: actions/checkout@v4
 
-          for i in $(seq 0 $((EP_COUNT - 1))); do
-            EP_INFO=$(python3 -c "import json; d=json.load(open('episodes_list.json')); print(json.dumps(d[$i]))")
-            EP_NUM=$(echo "$EP_INFO" | python3 -c "import sys,json; print(json.load(sys.stdin)['episode'])")
-            EP_PATH=$(echo "$EP_INFO" | python3 -c "import sys,json; print(json.load(sys.stdin)['path'])")
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          chmod +x scripts/report_status.sh
 
-            echo "=================================================="
-            echo "Processing Episode $EP_NUM ($EP_PATH)"
-            echo "=================================================="
+      - name: Set up Python deps
+        run: pip install --quiet google-api-python-client google-auth requests Pillow
 
-            SRT_URL="${SRT_ARRAY[$i]}"
-            if [ -z "$SRT_URL" ]; then
-              echo "WARNING: No srt URL for episode $EP_NUM, skipping."
-              FAILED_EPISODES="${FAILED_EPISODES} ${EP_NUM}(no-srt)"
-              curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-                -d chat_id="${CHAT_ID}" \
-                --data-urlencode text="⚠️ Episode ${EP_NUM} skipped: no subtitle URL provided."
-              continue
-            fi
+      - name: Download prepared subs + font for ep${{ matrix.episode.episode_number }}
+        uses: actions/download-artifact@v4
+        with:
+          name: batch-subs-ep${{ matrix.episode.episode_number }}
 
-            # Subtitle prep runs ONCE per episode (translation is expensive),
-            # reused by all 3 quality passes below.
-            (
-              set -e
-              curl -f -L -o "subs_raw_ep${EP_NUM}.srt" "$SRT_URL"
+      - name: Build sanitized output name (drama_S<season>E<episode>_<quality>)
+        id: name
+        run: |
+          set -e
+          RAW="${{ inputs.drama_name }}_S${{ inputs.season_number }}E${{ matrix.episode.episode_number }}"
+          SAFE=$(echo "$RAW" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+          OUT_NAME="${SAFE}_${{ matrix.quality }}.mp4"
+          echo "OUT_NAME=${OUT_NAME}" >> "$GITHUB_ENV"
+          echo "Output filename will be: ${OUT_NAME}"
 
-              if [ "$SUB_TYPE" == "english" ]; then
-                python scripts/translate.py "subs_raw_ep${EP_NUM}.srt" "subs_ep${EP_NUM}.srt"
-              else
-                python scripts/clean_srt.py "subs_raw_ep${EP_NUM}.srt" "subs_ep${EP_NUM}.srt"
-              fi
+      - name: Fetch render settings for ${{ matrix.quality }}
+        run: |
+          set -e
+          RESULT=$(curl -s "${SUPABASE_URL}/rest/v1/render_settings?quality=eq.${{ matrix.quality }}&select=*" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}")
+          python3 -c "
+          import json, sys, os
+          try:
+              rows = json.loads(sys.argv[1]); s = rows[0] if rows else {}
+          except Exception:
+              s = {}
+          out = os.environ['GITHUB_ENV']
+          with open(out, 'a') as f:
+              f.write(f\"RENDER_WATERMARK_TEXT={s.get('watermark_text', 'OnlyKSub')}\n\")
+              f.write(f\"RENDER_WATERMARK_OPACITY={s.get('watermark_opacity', 0.6)}\n\")
+              f.write(f\"RENDER_WATERMARK_FONTSIZE={s.get('watermark_fontsize', 16)}\n\")
+              f.write(f\"RENDER_CRF={s.get('crf', 23)}\n\")
+              f.write(f\"RENDER_AUDIO_BITRATE={s.get('audio_bitrate', '128k')}\n\")
+          " "$RESULT"
 
-              cp "$EP_PATH" "input_video_ep${EP_NUM}.mp4" || cp "$EP_PATH" "input_video_ep${EP_NUM}.mkv"
-              INPUT_FILE=$(ls input_video_ep${EP_NUM}.* | head -1)
-              echo "INPUT_FILE=${INPUT_FILE}" >> ep_context.env
+      - name: Download episode video (ep${{ matrix.episode.episode_number }}, ${{ matrix.quality }})
+        run: |
+          set -e
+          ./scripts/report_status.sh "download_ep${{ matrix.episode.episode_number }}_${{ matrix.quality }}" "started"
+          URL="${{ matrix.episode.video_url }}"
+          if echo "$URL" | grep -q "pixeldrain.com/u/"; then
+            FILE_ID=$(echo "$URL" | sed -E 's#.*pixeldrain\.com/u/([a-zA-Z0-9]+).*#\1#')
+            URL="https://pixeldrain.com/api/file/${FILE_ID}"
+          fi
+          if ! curl -f -L -A "Mozilla/5.0" -e "https://pixeldrain.com/" -o input_video.mp4 "$URL"; then
+            ./scripts/report_status.sh "download_ep${{ matrix.episode.episode_number }}_${{ matrix.quality }}" "failed"
+            exit 1
+          fi
+          ./scripts/report_status.sh "download_ep${{ matrix.episode.episode_number }}_${{ matrix.quality }}" "success"
 
-              CROP=$(python3 scripts/detect_crop.py "$INPUT_FILE" --threshold 24 --samples 30 | grep "^crop=" || true)
-              if [ -z "$CROP" ]; then
-                echo "Episode $EP_NUM: no reliable crop detected, using full frame."
-                echo "CROP_FILTER=" >> ep_context.env
-              else
-                echo "Episode $EP_NUM: detected $CROP"
-                echo "CROP_FILTER=${CROP}," >> ep_context.env
-              fi
-
-              # Fetch render settings once per episode (1080p row for font/margin/outline)
-              curl -s "${SUPABASE_URL}/rest/v1/render_settings?quality=eq.1080p&select=*" \
-                -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
-                -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
-                -o /tmp/render_settings.json
-              python3 scripts/parse_render_settings.py /tmp/render_settings.json >> ep_context.env
-
-              source ep_context.env
-              python scripts/srt_to_ass.py "subs_ep${EP_NUM}.srt" "subs_ep${EP_NUM}.ass" "$SINHALA_FONT_NAME" \
-                --font-size "$RENDER_FONT_SIZE" --margin-v "$RENDER_MARGIN_V" --outline "$RENDER_OUTLINE"
-            )
-            if [ $? -ne 0 ]; then
-              echo "ERROR: Episode $EP_NUM subtitle prep failed - skipping all qualities for this episode."
-              FAILED_EPISODES="${FAILED_EPISODES} ${EP_NUM}(prep)"
-              curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-                -d chat_id="${CHAT_ID}" \
-                --data-urlencode text="❌ Episode ${EP_NUM} failed at subtitle/prep stage - check the log."
-              continue
-            fi
-            source ep_context.env
-
-            for QUALITY in "${QUALITIES[@]}"; do
-              # Each quality runs in its own subshell - one quality failing
-              # only skips that quality, not the rest of the episode/season.
-              (
-                set -e
-                SCALE="${SCALE_MAP[$QUALITY]}"
-                OUT_NAME="${SAFE_NAME}_S${SEASON_NUMBER}E${EP_NUM}_${QUALITY}.mp4"
-
-                # Per-quality render settings (watermark/crf/bitrate)
-                curl -s "${SUPABASE_URL}/rest/v1/render_settings?quality=eq.${QUALITY}&select=*" \
-                  -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
-                  -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
-                  -o /tmp/render_settings_q.json
-                python3 scripts/parse_render_settings.py /tmp/render_settings_q.json >> q_context.env
-                source q_context.env
-
-                FONT_DIR=$(pwd)/sinhala-font
-                FILTER="${CROP_FILTER}ass=subs_ep${EP_NUM}.ass:fontsdir=${FONT_DIR},scale=${SCALE},"
-                FILTER="${FILTER}drawtext=text='${RENDER_WATERMARK_TEXT}':fontfile=${SINHALA_FONT_PATH}:fontsize=${RENDER_WATERMARK_FONTSIZE}:fontcolor=white@${RENDER_WATERMARK_OPACITY}:borderw=1:bordercolor=black@0.5:x=w-tw-16:y=h-th-16"
-
-                echo "Burning Episode $EP_NUM ($QUALITY) -> $OUT_NAME"
-                ffmpeg -y -i "$INPUT_FILE" \
-                  -vf "$FILTER" \
-                  -c:v libx264 -preset veryfast -crf "${RENDER_CRF}" -pix_fmt yuv420p \
-                  -c:a aac -b:a "${RENDER_AUDIO_BITRATE}" \
-                  -movflags +faststart \
-                  "$OUT_NAME"
-
-                echo "Uploading Episode $EP_NUM ($QUALITY) to Pixeldrain..."
-                python scripts/upload_pixeldrain.py "$OUT_NAME"
-                PIXELDRAIN_LINK=$(cat pixeldrain_link.txt)
-                echo "Pixeldrain link: $PIXELDRAIN_LINK"
-
-                VOE_LINK=""
-                if [ "$QUALITY" == "1080p" ]; then
-                  echo "Uploading Episode $EP_NUM to VOE.sx..."
-                  RESPONSE=$(curl -s "https://voe.sx/api/upload/url?key=${VOE_API_KEY}&url=${PIXELDRAIN_LINK}")
-                  QUEUE_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',{}).get('queueID',''))" 2>/dev/null || echo "")
-                  if [ -n "$QUEUE_ID" ]; then
-                    for attempt in $(seq 1 90); do
-                      sleep 10
-                      STATUS=$(curl -s "https://voe.sx/api/upload/url/list?key=${VOE_API_KEY}&id=${QUEUE_ID}")
-                      PERCENT=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['list']['data'][0].get('percent', 0))" 2>/dev/null || echo "0")
-                      FILE_CODE=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['list']['data'][0].get('file_code', ''))" 2>/dev/null || echo "")
-                      if [ "$PERCENT" = "100" ]; then
-                        VOE_LINK="https://voe.sx/e/${FILE_CODE}"
-                        echo "VOE embed link ready: $VOE_LINK"
-                        break
-                      fi
-                    done
-                  else
-                    echo "WARNING: VOE upload could not be queued (bad response: $RESPONSE), continuing without VOE link."
-                  fi
-                fi
-
-                echo "Notifying website for Episode $EP_NUM ($QUALITY)..."
-                curl -s -X POST "https://onlyksub.vercel.app/api/webhook-hardcode-complete" \
-                  -H "Content-Type: application/json" \
-                  -H "x-webhook-secret: ${WEBHOOK_SECRET}" \
-                  -d "{
-                    \"tmdb_id\": ${TMDB_ID},
-                    \"season_number\": ${SEASON_NUMBER},
-                    \"episode_number\": ${EP_NUM},
-                    \"pixeldrain_download_url\": \"${PIXELDRAIN_LINK}\",
-                    \"voe_embed_url\": \"${VOE_LINK}\",
-                    \"quality\": \"${QUALITY}\"
-                  }"
-
-                curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-                  -d chat_id="${CHAT_ID}" \
-                  --data-urlencode text="✅ Episode ${EP_NUM} (${QUALITY}) done! Pixeldrain: ${PIXELDRAIN_LINK}"
-
-                rm -f "$OUT_NAME"
-                echo "Episode $EP_NUM ($QUALITY) complete."
-              )
-              Q_STATUS=$?
-              if [ $Q_STATUS -ne 0 ]; then
-                echo "ERROR: Episode $EP_NUM ($QUALITY) failed (exit $Q_STATUS) - moving on."
-                FAILED_EPISODES="${FAILED_EPISODES} ${EP_NUM}(${QUALITY})"
-                curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-                  -d chat_id="${CHAT_ID}" \
-                  --data-urlencode text="❌ Episode ${EP_NUM} (${QUALITY}) failed - check the GitHub Actions log."
-              fi
-            done
-
-            rm -f "input_video_ep${EP_NUM}".* "subs_ep${EP_NUM}".* ep_context.env q_context.env
-          done
-
-          if [ -n "$FAILED_EPISODES" ]; then
-            echo "Episodes with problems:$FAILED_EPISODES"
-            echo "FAILED_EPISODES=$FAILED_EPISODES" >> "$GITHUB_ENV"
+      - name: Detect and remove black bars (robust pixel-based auto-crop)
+        run: |
+          set -e
+          CROP=$(python3 scripts/detect_crop.py input_video.mp4 --threshold 24 --samples 30 | grep "^crop=" || true)
+          if [ -z "$CROP" ]; then
+            echo "CROP_FILTER=" >> "$GITHUB_ENV"
+          else
+            echo "CROP_FILTER=${CROP}," >> "$GITHUB_ENV"
           fi
 
-      - name: Final notification
+      - name: Burn subtitles + watermark (ep${{ matrix.episode.episode_number }}, ${{ matrix.quality }})
+        run: |
+          set -e
+          ./scripts/report_status.sh "burn_ep${{ matrix.episode.episode_number }}_${{ matrix.quality }}" "started"
+          FONT_DIR=$(pwd)/sinhala-font
+          FONT_PATH="${FONT_DIR}/NotoSansSinhala-Bold.ttf"
+
+          DRAMA_NAME="${{ inputs.drama_name }}"
+          if [ -n "$DRAMA_NAME" ]; then
+            WATERMARK_TEXT="${DRAMA_NAME} EP${{ matrix.episode.episode_number }} - ${RENDER_WATERMARK_TEXT}"
+          else
+            WATERMARK_TEXT="${RENDER_WATERMARK_TEXT}"
+          fi
+          WATERMARK_TEXT=$(echo "$WATERMARK_TEXT" | sed "s/'/\\\\'/g" | sed "s/:/\\\\:/g")
+
+          FILTER="${CROP_FILTER}ass=subs.ass:fontsdir=${FONT_DIR},scale=${{ matrix.scale }},"
+          FILTER="${FILTER}drawtext=text='${WATERMARK_TEXT}':fontfile=${FONT_PATH}:fontsize=${RENDER_WATERMARK_FONTSIZE}:fontcolor=white@${RENDER_WATERMARK_OPACITY}:borderw=1:bordercolor=black@0.5:x=w-tw-16:y=h-th-16"
+
+          if ! ffmpeg -y -i input_video.mp4 \
+            -vf "$FILTER" \
+            -c:v libx264 -preset veryfast -crf "${RENDER_CRF}" -pix_fmt yuv420p \
+            -c:a aac -b:a "${RENDER_AUDIO_BITRATE}" \
+            -movflags +faststart \
+            "$OUT_NAME"; then
+            ./scripts/report_status.sh "burn_ep${{ matrix.episode.episode_number }}_${{ matrix.quality }}" "failed"
+            exit 1
+          fi
+          ./scripts/report_status.sh "burn_ep${{ matrix.episode.episode_number }}_${{ matrix.quality }}" "success"
+
+      - name: Upload to Google Drive (1080p only)
+        id: drive
+        if: matrix.quality == '1080p'
+        continue-on-error: true
+        env:
+          GDRIVE_SA_JSON_B64: ${{ secrets.GDRIVE_SA_JSON_B64 }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          set -e
+          echo "$GDRIVE_SA_JSON_B64" | base64 -d > sa.json
+          if GDRIVE_SA_JSON=sa.json python scripts/upload_drive.py "$OUT_NAME"; then
+            echo "link=$(cat drive_link.txt)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload to Pixeldrain
+        id: pixeldrain
+        env:
+          PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+        run: |
+          set -e
+          ./scripts/report_status.sh "upload_ep${{ matrix.episode.episode_number }}_${{ matrix.quality }}" "started"
+          if python scripts/upload_pixeldrain.py "$OUT_NAME"; then
+            echo "link=$(cat pixeldrain_link.txt)" >> "$GITHUB_OUTPUT"
+            ./scripts/report_status.sh "upload_ep${{ matrix.episode.episode_number }}_${{ matrix.quality }}" "success" "{\"link\":\"$(cat pixeldrain_link.txt)\"}"
+          else
+            ./scripts/report_status.sh "upload_ep${{ matrix.episode.episode_number }}_${{ matrix.quality }}" "failed"
+            exit 1
+          fi
+
+      - name: Upload to VOE.sx (1080p only)
+        id: voe
+        if: matrix.quality == '1080p'
+        continue-on-error: true
+        env:
+          VOE_API_KEY: ${{ secrets.VOE_API_KEY }}
+          PIXELDRAIN_LINK: ${{ steps.pixeldrain.outputs.link }}
+        run: |
+          RESPONSE=$(curl -s "https://voe.sx/api/upload/url?key=${VOE_API_KEY}&url=${PIXELDRAIN_LINK}")
+          echo "VOE upload response: $RESPONSE"
+          QUEUE_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',{}).get('queueID',''))" 2>/dev/null || echo "")
+
+          if [ -z "$QUEUE_ID" ]; then
+            echo "WARNING: VOE upload could not be queued, continuing without VOE link."
+            exit 0
+          fi
+
+          for i in $(seq 1 90); do
+            sleep 10
+            STATUS=$(curl -s "https://voe.sx/api/upload/url/list?key=${VOE_API_KEY}&id=${QUEUE_ID}")
+            PERCENT=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['list']['data'][0].get('percent', 0))" 2>/dev/null || echo "0")
+            FILE_CODE=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['list']['data'][0].get('file_code', ''))" 2>/dev/null || echo "")
+            echo "Attempt $i: percent=$PERCENT"
+            if [ "$PERCENT" = "100" ] && [ -n "$FILE_CODE" ]; then
+              echo "link=https://voe.sx/e/${FILE_CODE}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "WARNING: VOE processing timed out, continuing without VOE link."
+
+      - name: Notify website (webhook) for ep${{ matrix.episode.episode_number }} ${{ matrix.quality }}
+        if: always()
+        continue-on-error: true
+        env:
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          LINK: ${{ steps.pixeldrain.outputs.link }}
+          VOE_LINK: ${{ steps.voe.outputs.link }}
+        run: |
+          if [ -z "$LINK" ]; then exit 0; fi
+          curl -s -X POST "https://onlyksub.vercel.app/api/webhook-hardcode-complete" \
+            -H "Content-Type: application/json" \
+            -H "x-webhook-secret: ${WEBHOOK_SECRET}" \
+            -d "{
+              \"tmdb_id\": ${{ inputs.tmdb_id }},
+              \"season_number\": ${{ inputs.season_number }},
+              \"episode_number\": ${{ matrix.episode.episode_number }},
+              \"pixeldrain_download_url\": \"${LINK}\",
+              \"voe_embed_url\": \"${VOE_LINK}\",
+              \"quality\": \"${{ matrix.quality }}\"
+            }"
+
+      - name: Notify on Telegram for ep${{ matrix.episode.episode_number }} ${{ matrix.quality }}
         if: always()
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ inputs.chat_id }}
+          LINK: ${{ steps.pixeldrain.outputs.link }}
+          VOE_LINK: ${{ steps.voe.outputs.link }}
         run: |
+          if [ -n "$LINK" ]; then
+            TEXT="✅ ${{ inputs.drama_name }} S${{ inputs.season_number }}E${{ matrix.episode.episode_number }} (${{ matrix.quality }}) done! 📥 ${LINK}"
+            if [ -n "$VOE_LINK" ]; then
+              TEXT="${TEXT}"$'\n'"🎬 VOE: ${VOE_LINK}"
+            fi
+          else
+            TEXT="❌ ${{ inputs.drama_name }} S${{ inputs.season_number }}E${{ matrix.episode.episode_number }} (${{ matrix.quality }}) failed. Check the GitHub Actions log."
+          fi
           curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             -d chat_id="${CHAT_ID}" \
-            --data-urlencode text="🎉 Batch processing complete for ${{ inputs.drama_name }} (all qualities)!"
+            --data-urlencode text="${TEXT}"
+
+      - name: Upload artifact (backup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-burned-ep${{ matrix.episode.episode_number }}-${{ matrix.quality }}
+          path: ${{ env.OUT_NAME }}
+          retention-days: 3
+
+  # ============================================================
+  # JOB 4: Runs once ALL episode x quality burns finish.
+  # Marks the Supabase job row as done.
+  # ============================================================
+  finalize:
+    needs: burn
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark job done in dashboard
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          if [ -n "$SUPABASE_URL" ] && [ -n "$JOB_ID" ]; then
+            FINAL_STATUS="done"
+            if [ "${{ needs.burn.result }}" != "success" ]; then FINAL_STATUS="failed"; fi
+            curl -s -o /dev/null -X PATCH "${SUPABASE_URL}/rest/v1/jobs?id=eq.${JOB_ID}" \
+              -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+              -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+              -H "Content-Type: application/json" \
+              -d "{\"status\":\"${FINAL_STATUS}\",\"finished_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"github_run_url\":\"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"}" \
+              || true
+          fi

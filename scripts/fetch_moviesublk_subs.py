@@ -344,27 +344,36 @@ def _pick_best_match(results, query):
 
 
 def cmd_auto(args):
-    """One-shot: name -> search -> best match -> extract -> resolve -> download ALL."""
-    print(f"Searching moviesublk.com for: {args.query!r}", file=sys.stderr)
-    results = search_posts(args.query, max_results=args.max_results)
-    if not results:
-        print("No matching posts found. Try a shorter/simpler name.", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Found {len(results)} candidate post(s):", file=sys.stderr)
-    for i, r in enumerate(results, 1):
-        print(f"  {i}. {r['title']}", file=sys.stderr)
-
-    if args.pick:
-        idx = args.pick - 1
-        if idx < 0 or idx >= len(results):
-            print(f"--pick {args.pick} is out of range (1-{len(results)}).", file=sys.stderr)
-            sys.exit(1)
-        chosen = results[idx]
+    """One-shot: name -> search -> best match -> extract -> resolve -> download ALL.
+    If --url is given, search is skipped entirely and that post is used directly
+    (useful when moviesublk.com blocks search/feed requests from this network/IP
+    but a direct page fetch still works)."""
+    if args.url:
+        chosen = {"title": args.query or args.url, "url": args.url}
+        print(f"Using direct URL (search skipped): {chosen['url']}\n", file=sys.stderr)
     else:
-        chosen = _pick_best_match(results, args.query)
+        print(f"Searching moviesublk.com for: {args.query!r}", file=sys.stderr)
+        results = search_posts(args.query, max_results=args.max_results)
+        if not results:
+            print("No matching posts found. Try a shorter/simpler name, or pass --url "
+                  "with the post link directly if search is blocked on this network.",
+                  file=sys.stderr)
+            sys.exit(1)
 
-    print(f"\nUsing: {chosen['title']}\n  {chosen['url']}\n", file=sys.stderr)
+        print(f"Found {len(results)} candidate post(s):", file=sys.stderr)
+        for i, r in enumerate(results, 1):
+            print(f"  {i}. {r['title']}", file=sys.stderr)
+
+        if args.pick:
+            idx = args.pick - 1
+            if idx < 0 or idx >= len(results):
+                print(f"--pick {args.pick} is out of range (1-{len(results)}).", file=sys.stderr)
+                sys.exit(1)
+            chosen = results[idx]
+        else:
+            chosen = _pick_best_match(results, args.query)
+
+        print(f"\nUsing: {chosen['title']}\n  {chosen['url']}\n", file=sys.stderr)
 
     html = fetch_post(chosen["url"])
     series_data = extract_series_data(html)
@@ -424,8 +433,12 @@ def main():
                             help="If set, download+save each resolved .ass/.srt file here")
     p_extract.set_defaults(func=cmd_extract)
 
-    p_auto = sub.add_parser("auto", help="One-shot: give a name, get ALL episode subtitle files downloaded")
-    p_auto.add_argument("query", help="Movie/series name, e.g. \"Let's Get Divorced\"")
+    p_auto = sub.add_parser("auto", help="One-shot: give a name (or --url), get ALL episode subtitle files downloaded")
+    p_auto.add_argument("query", nargs="?", default=None,
+                         help="Movie/series name, e.g. \"Let's Get Divorced\" (omit if using --url)")
+    p_auto.add_argument("--url", default=None,
+                         help="Skip search entirely and use this post URL directly "
+                              "(needed if search/feed requests are blocked from your network/IP)")
     p_auto.add_argument("--max-results", type=int, default=8,
                          help="How many search candidates to consider (default 8)")
     p_auto.add_argument("--pick", type=int, default=None,
@@ -436,6 +449,8 @@ def main():
     p_auto.set_defaults(func=cmd_auto)
 
     args = parser.parse_args()
+    if args.cmd == "auto" and not args.query and not args.url:
+        parser.error("auto requires either a query (series name) or --url")
     args.func(args)
 
 

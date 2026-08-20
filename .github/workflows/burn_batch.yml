@@ -1,4 +1,4 @@
-name: Burn Subtitles Batch (Season/Archive)
+name: Burn Subtitles Batch (Season/Archive - 3 Qualities)
 
 on:
   workflow_dispatch:
@@ -23,15 +23,14 @@ on:
         description: "TMDB show ID"
         required: true
         type: string
+      drama_name:
+        description: "Drama/show name (used to build output filenames)"
+        required: true
+        type: string
       season_number:
         description: "Season number"
         required: true
         type: string
-      quality:
-        description: "Video quality label (1080p, 720p, 540p, 480p)"
-        required: false
-        type: string
-        default: "1080p"
       sub_format:
         description: "Subtitle format uploaded: srt or ass"
         required: false
@@ -67,6 +66,14 @@ jobs:
       - name: Set up Python deps
         run: |
           pip install --quiet google-generativeai google-api-python-client google-auth requests Pillow
+
+      - name: Build sanitized drama name for filenames
+        id: name
+        run: |
+          set -e
+          SAFE=$(echo "${{ inputs.drama_name }}" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+          echo "SAFE_NAME=${SAFE}" >> "$GITHUB_ENV"
+          echo "Output basenames will be: ${SAFE}_S<season>E<ep>_<quality>.mp4"
 
       - name: Download archive
         run: |
@@ -129,7 +136,7 @@ jobs:
           PYEOF
           cat episodes_list.json
 
-      - name: Process episodes sequentially (burn, upload, notify)
+      - name: Process episodes sequentially (burn all 3 qualities, upload, notify)
         env:
           GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
@@ -146,7 +153,6 @@ jobs:
           TMDB_ID: ${{ inputs.tmdb_id }}
           SEASON_NUMBER: ${{ inputs.season_number }}
           SUB_TYPE: ${{ inputs.sub_type }}
-          QUALITY: ${{ inputs.quality }}
           SRT_URLS_RAW: ${{ inputs.srt_urls }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -154,6 +160,8 @@ jobs:
           set -e
 
           IFS=',' read -ra SRT_ARRAY <<< "$SRT_URLS_RAW"
+          QUALITIES=("1080p" "720p" "480p")
+          declare -A SCALE_MAP=( ["1080p"]="1920:-2" ["720p"]="1280:-2" ["480p"]="854:-2" )
 
           python3 << 'PYEOF' > episode_count.txt
           import json
@@ -162,17 +170,7 @@ jobs:
           print(len(episodes))
           PYEOF
           EP_COUNT=$(cat episode_count.txt)
-          echo "Total episodes to process: $EP_COUNT (quality: $QUALITY)"
-
-          # Fetch render settings once (same quality for the whole batch run)
-          curl -s "${SUPABASE_URL}/rest/v1/render_settings?quality=eq.${QUALITY}&select=*" \
-            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
-            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
-            -o /tmp/render_settings.json
-
-          python3 scripts/parse_render_settings.py /tmp/render_settings.json >> "$GITHUB_ENV"
-          source "$GITHUB_ENV"
-          echo "Render settings loaded: font=$RENDER_FONT_SIZE crf=$RENDER_CRF"
+          echo "Total episodes to process: $EP_COUNT (qualities: ${QUALITIES[*]})"
 
           FAILED_EPISODES=""
 
@@ -182,7 +180,7 @@ jobs:
             EP_PATH=$(echo "$EP_INFO" | python3 -c "import sys,json; print(json.load(sys.stdin)['path'])")
 
             echo "=================================================="
-            echo "Processing Episode $EP_NUM ($EP_PATH) - Quality: $QUALITY"
+            echo "Processing Episode $EP_NUM ($EP_PATH)"
             echo "=================================================="
 
             SRT_URL="${SRT_ARRAY[$i]}"
@@ -195,13 +193,10 @@ jobs:
               continue
             fi
 
-            # Everything below runs in a subshell with its own 'set -e' so a
-            # failure anywhere in THIS episode (bad srt link, download error,
-            # ffmpeg crash, VOE quota, etc.) only aborts this one episode -
-            # it can no longer kill the outer loop / the rest of the season.
+            # Subtitle prep runs ONCE per episode (translation is expensive),
+            # reused by all 3 quality passes below.
             (
               set -e
-
               curl -f -L -o "subs_raw_ep${EP_NUM}.srt" "$SRT_URL"
 
               if [ "$SUB_TYPE" == "english" ]; then
@@ -212,90 +207,124 @@ jobs:
 
               cp "$EP_PATH" "input_video_ep${EP_NUM}.mp4" || cp "$EP_PATH" "input_video_ep${EP_NUM}.mkv"
               INPUT_FILE=$(ls input_video_ep${EP_NUM}.* | head -1)
+              echo "INPUT_FILE=${INPUT_FILE}" >> ep_context.env
 
-              # Robust pixel-based auto-crop (same detector used by burn.yml) -
-              # replaces the old cropdetect/-t 30/tail -1 logic which only
-              # checked the first 30s and could be fooled by burnt-in subtitle
-              # text, missing black bars that only became stable later in the
-              # episode.
               CROP=$(python3 scripts/detect_crop.py "$INPUT_FILE" --threshold 24 --samples 30 | grep "^crop=" || true)
               if [ -z "$CROP" ]; then
                 echo "Episode $EP_NUM: no reliable crop detected, using full frame."
-                CROP_FILTER=""
+                echo "CROP_FILTER=" >> ep_context.env
               else
                 echo "Episode $EP_NUM: detected $CROP"
-                CROP_FILTER="${CROP},"
+                echo "CROP_FILTER=${CROP}," >> ep_context.env
               fi
 
-              WATERMARK_TEXT="${RENDER_WATERMARK_TEXT}"
-              FONT_DIR=$(pwd)/sinhala-font
+              # Fetch render settings once per episode (1080p row for font/margin/outline)
+              curl -s "${SUPABASE_URL}/rest/v1/render_settings?quality=eq.1080p&select=*" \
+                -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+                -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+                -o /tmp/render_settings.json
+              python3 scripts/parse_render_settings.py /tmp/render_settings.json >> ep_context.env
+
+              source ep_context.env
               python scripts/srt_to_ass.py "subs_ep${EP_NUM}.srt" "subs_ep${EP_NUM}.ass" "$SINHALA_FONT_NAME" \
                 --font-size "$RENDER_FONT_SIZE" --margin-v "$RENDER_MARGIN_V" --outline "$RENDER_OUTLINE"
-              FILTER="${CROP_FILTER}ass=subs_ep${EP_NUM}.ass:fontsdir=${FONT_DIR},"
-              FILTER="${FILTER}drawtext=text='${WATERMARK_TEXT}':fontfile=${SINHALA_FONT_PATH}:fontsize=${RENDER_WATERMARK_FONTSIZE}:fontcolor=white@${RENDER_WATERMARK_OPACITY}:borderw=1:bordercolor=black@0.5:x=w-tw-16:y=h-th-16"
-              ffmpeg -y -i "$INPUT_FILE" \
-                -vf "$FILTER" \
-                -c:v libx264 -preset veryfast -crf "${RENDER_CRF}" -pix_fmt yuv420p \
-                -c:a aac -b:a "${RENDER_AUDIO_BITRATE}" \
-                -movflags +faststart \
-                "output_ep${EP_NUM}.mp4"
-
-              echo "Uploading Episode $EP_NUM to Pixeldrain..."
-              python scripts/upload_pixeldrain.py "output_ep${EP_NUM}.mp4"
-              PIXELDRAIN_LINK=$(cat pixeldrain_link.txt)
-              echo "Pixeldrain link: $PIXELDRAIN_LINK"
-
-              echo "Uploading Episode $EP_NUM to VOE.sx..."
-              VOE_LINK=""
-              RESPONSE=$(curl -s "https://voe.sx/api/upload/url?key=${VOE_API_KEY}&url=${PIXELDRAIN_LINK}")
-              QUEUE_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',{}).get('queueID',''))" 2>/dev/null || echo "")
-
-              if [ -n "$QUEUE_ID" ]; then
-                for attempt in $(seq 1 90); do
-                  sleep 10
-                  STATUS=$(curl -s "https://voe.sx/api/upload/url/list?key=${VOE_API_KEY}&id=${QUEUE_ID}")
-                  PERCENT=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['list']['data'][0].get('percent', 0))" 2>/dev/null || echo "0")
-                  FILE_CODE=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['list']['data'][0].get('file_code', ''))" 2>/dev/null || echo "")
-                  if [ "$PERCENT" = "100" ]; then
-                    VOE_LINK="https://voe.sx/e/${FILE_CODE}"
-                    echo "VOE embed link ready: $VOE_LINK"
-                    break
-                  fi
-                done
-              else
-                echo "WARNING: VOE upload could not be queued (bad response: $RESPONSE), continuing without VOE link."
-              fi
-
-              echo "Notifying website for Episode $EP_NUM..."
-              curl -s -X POST "https://onlyksub.vercel.app/api/webhook-hardcode-complete" \
-                -H "Content-Type: application/json" \
-                -H "x-webhook-secret: ${WEBHOOK_SECRET}" \
-                -d "{
-                  \"tmdb_id\": ${TMDB_ID},
-                  \"season_number\": ${SEASON_NUMBER},
-                  \"episode_number\": ${EP_NUM},
-                  \"pixeldrain_download_url\": \"${PIXELDRAIN_LINK}\",
-                  \"voe_embed_url\": \"${VOE_LINK}\",
-                  \"quality\": \"${QUALITY}\"
-                }"
-
-              curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-                -d chat_id="${CHAT_ID}" \
-                --data-urlencode text="✅ Episode ${EP_NUM} done (${QUALITY})! Pixeldrain: ${PIXELDRAIN_LINK}"
-
-              echo "Episode $EP_NUM complete."
             )
-            EP_STATUS=$?
-
-            if [ $EP_STATUS -ne 0 ]; then
-              echo "ERROR: Episode $EP_NUM failed (exit $EP_STATUS) - moving on to the next episode."
-              FAILED_EPISODES="${FAILED_EPISODES} ${EP_NUM}"
+            if [ $? -ne 0 ]; then
+              echo "ERROR: Episode $EP_NUM subtitle prep failed - skipping all qualities for this episode."
+              FAILED_EPISODES="${FAILED_EPISODES} ${EP_NUM}(prep)"
               curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
                 -d chat_id="${CHAT_ID}" \
-                --data-urlencode text="❌ Episode ${EP_NUM} failed - check the GitHub Actions log. Continuing with the rest of the season."
+                --data-urlencode text="❌ Episode ${EP_NUM} failed at subtitle/prep stage - check the log."
+              continue
             fi
+            source ep_context.env
 
-            rm -f "input_video_ep${EP_NUM}".* "output_ep${EP_NUM}.mp4" "overlay_ep${EP_NUM}.mov"
+            for QUALITY in "${QUALITIES[@]}"; do
+              # Each quality runs in its own subshell - one quality failing
+              # only skips that quality, not the rest of the episode/season.
+              (
+                set -e
+                SCALE="${SCALE_MAP[$QUALITY]}"
+                OUT_NAME="${SAFE_NAME}_S${SEASON_NUMBER}E${EP_NUM}_${QUALITY}.mp4"
+
+                # Per-quality render settings (watermark/crf/bitrate)
+                curl -s "${SUPABASE_URL}/rest/v1/render_settings?quality=eq.${QUALITY}&select=*" \
+                  -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+                  -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+                  -o /tmp/render_settings_q.json
+                python3 scripts/parse_render_settings.py /tmp/render_settings_q.json >> q_context.env
+                source q_context.env
+
+                FONT_DIR=$(pwd)/sinhala-font
+                FILTER="${CROP_FILTER}ass=subs_ep${EP_NUM}.ass:fontsdir=${FONT_DIR},scale=${SCALE},"
+                FILTER="${FILTER}drawtext=text='${RENDER_WATERMARK_TEXT}':fontfile=${SINHALA_FONT_PATH}:fontsize=${RENDER_WATERMARK_FONTSIZE}:fontcolor=white@${RENDER_WATERMARK_OPACITY}:borderw=1:bordercolor=black@0.5:x=w-tw-16:y=h-th-16"
+
+                echo "Burning Episode $EP_NUM ($QUALITY) -> $OUT_NAME"
+                ffmpeg -y -i "$INPUT_FILE" \
+                  -vf "$FILTER" \
+                  -c:v libx264 -preset veryfast -crf "${RENDER_CRF}" -pix_fmt yuv420p \
+                  -c:a aac -b:a "${RENDER_AUDIO_BITRATE}" \
+                  -movflags +faststart \
+                  "$OUT_NAME"
+
+                echo "Uploading Episode $EP_NUM ($QUALITY) to Pixeldrain..."
+                python scripts/upload_pixeldrain.py "$OUT_NAME"
+                PIXELDRAIN_LINK=$(cat pixeldrain_link.txt)
+                echo "Pixeldrain link: $PIXELDRAIN_LINK"
+
+                VOE_LINK=""
+                if [ "$QUALITY" == "1080p" ]; then
+                  echo "Uploading Episode $EP_NUM to VOE.sx..."
+                  RESPONSE=$(curl -s "https://voe.sx/api/upload/url?key=${VOE_API_KEY}&url=${PIXELDRAIN_LINK}")
+                  QUEUE_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',{}).get('queueID',''))" 2>/dev/null || echo "")
+                  if [ -n "$QUEUE_ID" ]; then
+                    for attempt in $(seq 1 90); do
+                      sleep 10
+                      STATUS=$(curl -s "https://voe.sx/api/upload/url/list?key=${VOE_API_KEY}&id=${QUEUE_ID}")
+                      PERCENT=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['list']['data'][0].get('percent', 0))" 2>/dev/null || echo "0")
+                      FILE_CODE=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['list']['data'][0].get('file_code', ''))" 2>/dev/null || echo "")
+                      if [ "$PERCENT" = "100" ]; then
+                        VOE_LINK="https://voe.sx/e/${FILE_CODE}"
+                        echo "VOE embed link ready: $VOE_LINK"
+                        break
+                      fi
+                    done
+                  else
+                    echo "WARNING: VOE upload could not be queued (bad response: $RESPONSE), continuing without VOE link."
+                  fi
+                fi
+
+                echo "Notifying website for Episode $EP_NUM ($QUALITY)..."
+                curl -s -X POST "https://onlyksub.vercel.app/api/webhook-hardcode-complete" \
+                  -H "Content-Type: application/json" \
+                  -H "x-webhook-secret: ${WEBHOOK_SECRET}" \
+                  -d "{
+                    \"tmdb_id\": ${TMDB_ID},
+                    \"season_number\": ${SEASON_NUMBER},
+                    \"episode_number\": ${EP_NUM},
+                    \"pixeldrain_download_url\": \"${PIXELDRAIN_LINK}\",
+                    \"voe_embed_url\": \"${VOE_LINK}\",
+                    \"quality\": \"${QUALITY}\"
+                  }"
+
+                curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+                  -d chat_id="${CHAT_ID}" \
+                  --data-urlencode text="✅ Episode ${EP_NUM} (${QUALITY}) done! Pixeldrain: ${PIXELDRAIN_LINK}"
+
+                rm -f "$OUT_NAME"
+                echo "Episode $EP_NUM ($QUALITY) complete."
+              )
+              Q_STATUS=$?
+              if [ $Q_STATUS -ne 0 ]; then
+                echo "ERROR: Episode $EP_NUM ($QUALITY) failed (exit $Q_STATUS) - moving on."
+                FAILED_EPISODES="${FAILED_EPISODES} ${EP_NUM}(${QUALITY})"
+                curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+                  -d chat_id="${CHAT_ID}" \
+                  --data-urlencode text="❌ Episode ${EP_NUM} (${QUALITY}) failed - check the GitHub Actions log."
+              fi
+            done
+
+            rm -f "input_video_ep${EP_NUM}".* "subs_ep${EP_NUM}".* ep_context.env q_context.env
           done
 
           if [ -n "$FAILED_EPISODES" ]; then
@@ -311,4 +340,4 @@ jobs:
         run: |
           curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             -d chat_id="${CHAT_ID}" \
-            --data-urlencode text="🎉 Batch processing complete for the whole season!"
+            --data-urlencode text="🎉 Batch processing complete for ${{ inputs.drama_name }} (all qualities)!"

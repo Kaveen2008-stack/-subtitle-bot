@@ -1,9 +1,10 @@
-name: Burn Subtitles
+name: Burn Subtitles (Matrix Parallel - 3 Qualities)
+
 on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: "Direct/Pixeldrain video URL"
+        description: "Direct/Pixeldrain video URL (best available source, e.g. 1080p)"
         required: true
         type: string
       srt_url:
@@ -22,6 +23,10 @@ on:
         description: "TMDB show ID"
         required: true
         type: string
+      drama_name:
+        description: "Drama/show name (used to build the output filename)"
+        required: true
+        type: string
       season_number:
         description: "Season number"
         required: true
@@ -30,11 +35,6 @@ on:
         description: "Episode number"
         required: true
         type: string
-      quality:
-        description: "Video quality label (1080p, 720p, 540p, 480p)"
-        required: false
-        type: string
-        default: "1080p"
       sub_format:
         description: "Subtitle format uploaded: srt or ass"
         required: false
@@ -54,25 +54,37 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  burn:
+  # ============================================================
+  # JOB 1: Runs ONCE. Subtitle download/clean/translate (Gemini -
+  # expensive, must not be duplicated across the 3 quality runners).
+  # Produces a shared subs.ass consumed by every quality job, plus
+  # a sanitized SAFE_NAME artifact used to build output filenames.
+  # ============================================================
+  prepare-subs:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ inputs.chat_id }}
-      JOB_ID: ${{ inputs.job_id }}
-      TELEGRAM_MESSAGE_ID: ${{ inputs.telegram_message_id }}
+    outputs:
+      safe_name: ${{ steps.name.outputs.safe_name }}
     steps:
       - name: Checkout repo (for scripts)
         uses: actions/checkout@v4
 
-      - name: Install ffmpeg and Sinhala font (Noto Sans Sinhala)
+      - name: Build sanitized output name (drama_S<season>E<episode>)
+        id: name
         run: |
           set -e
-          sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg
+          RAW="${{ inputs.drama_name }}_S${{ inputs.season_number }}E${{ inputs.episode_number }}"
+          # spaces -> underscores, strip anything that isn't alnum/underscore/hyphen
+          SAFE=$(echo "$RAW" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+          echo "safe_name=${SAFE}" >> "$GITHUB_OUTPUT"
+          echo "Output basename will be: ${SAFE}_<quality>.mp4"
+
+      - name: Install Sinhala font (Noto Sans Sinhala)
+        run: |
+          set -e
           pip install --quiet fonttools
           mkdir -p sinhala-font
           python scripts/install_sinhala_font.py sinhala-font
@@ -80,16 +92,11 @@ jobs:
             echo "ERROR: Font generation failed or file is not a valid font"
             exit 1
           fi
-          mkdir -p /usr/share/fonts/truetype/custom
-          sudo cp sinhala-font/NotoSansSinhala-Bold.ttf /usr/share/fonts/truetype/custom/
-          sudo fc-cache -f
-          echo "SINHALA_FONT_PATH=sinhala-font/NotoSansSinhala-Bold.ttf" >> "$GITHUB_ENV"
           echo "SINHALA_FONT_NAME=Noto Sans Sinhala" >> "$GITHUB_ENV"
           chmod +x scripts/report_status.sh
 
       - name: Set up Python deps
-        run: |
-          pip install --quiet google-generativeai google-api-python-client google-auth requests Pillow
+        run: pip install --quiet google-generativeai requests
 
       - name: Download subtitle file
         run: |
@@ -102,7 +109,7 @@ jobs:
         if: inputs.sub_format != 'ass'
         run: python scripts/clean_srt.py subs_raw.srt subs_cleaned.srt
 
-      - name: Translate to Sinhala (only if needed, after cleaning)
+      - name: Translate to Sinhala (only if needed, after cleaning - runs ONCE)
         if: inputs.sub_type == 'english' && inputs.sub_format != 'ass'
         env:
           GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
@@ -124,68 +131,24 @@ jobs:
         if: inputs.sub_format == 'ass'
         run: cp subs_raw.ass subs.ass
 
-      - name: Download video
+      - name: Fetch render settings (uses 1080p row for font/margin/outline - shared across qualities)
         run: |
           set -e
-          ./scripts/report_status.sh "download" "started"
-          URL="${{ inputs.video_url }}"
-          if echo "$URL" | grep -q "pixeldrain.com/u/"; then
-            FILE_ID=$(echo "$URL" | sed -E 's#.*pixeldrain\.com/u/([a-zA-Z0-9]+).*#\1#')
-            URL="https://pixeldrain.com/api/file/${FILE_ID}"
-          fi
-          if ! curl -f -L -A "Mozilla/5.0" -e "https://pixeldrain.com/" -o input_video.mp4 "$URL"; then
-            ./scripts/report_status.sh "download" "failed" '{"reason":"curl download failed"}'
-            exit 1
-          fi
-          ls -lh input_video.mp4
-          file input_video.mp4
-          if ! file input_video.mp4 | grep -qE "MP4|Matroska|ISO Media|WebM"; then
-            ./scripts/report_status.sh "download" "failed" '{"reason":"not a valid video file"}'
-            echo "ERROR: downloaded file is not a valid video (link may be expired/invalid)"
-            head -c 500 input_video.mp4
-            exit 1
-          fi
-          SIZE=$(du -h input_video.mp4 | cut -f1)
-          ./scripts/report_status.sh "download" "success" "{\"size\":\"${SIZE}\"}"
-
-      - name: Fetch render settings for this quality
-        run: |
-          set -e
-          RESULT=$(curl -s "${SUPABASE_URL}/rest/v1/render_settings?quality=eq.${{ inputs.quality }}&select=*" \
+          RESULT=$(curl -s "${SUPABASE_URL}/rest/v1/render_settings?quality=eq.1080p&select=*" \
             -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
             -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}")
           python3 -c "
           import json, sys, os
           try:
               rows = json.loads(sys.argv[1])
-              if not rows:
-                  raise ValueError('no settings row')
-              s = rows[0]
-              out = os.environ['GITHUB_ENV']
-              with open(out, 'a') as f:
-                  f.write(f\"RENDER_RESOLUTION_HEIGHT={s.get('resolution_height', 720)}\n\")
-                  f.write(f\"RENDER_FONT_SIZE={s.get('font_size', 42)}\n\")
-                  f.write(f\"RENDER_MARGIN_V={s.get('margin_v', 14)}\n\")
-                  f.write(f\"RENDER_OUTLINE={s.get('outline_width', 1)}\n\")
-                  f.write(f\"RENDER_WATERMARK_TEXT={s.get('watermark_text', 'OnlyKSub')}\n\")
-                  f.write(f\"RENDER_WATERMARK_OPACITY={s.get('watermark_opacity', 0.6)}\n\")
-                  f.write(f\"RENDER_WATERMARK_FONTSIZE={s.get('watermark_fontsize', 16)}\n\")
-                  f.write(f\"RENDER_CRF={s.get('crf', 23)}\n\")
-                  f.write(f\"RENDER_AUDIO_BITRATE={s.get('audio_bitrate', '128k')}\n\")
-              print('Render settings loaded')
-          except Exception as e:
-              print(f'WARNING: could not fetch render settings ({e}), using defaults', file=sys.stderr)
-              out = os.environ['GITHUB_ENV']
-              with open(out, 'a') as f:
-                  f.write('RENDER_RESOLUTION_HEIGHT=720\n')
-                  f.write('RENDER_FONT_SIZE=42\n')
-                  f.write('RENDER_MARGIN_V=14\n')
-                  f.write('RENDER_OUTLINE=1\n')
-                  f.write('RENDER_WATERMARK_TEXT=OnlyKSub\n')
-                  f.write('RENDER_WATERMARK_OPACITY=0.6\n')
-                  f.write('RENDER_WATERMARK_FONTSIZE=16\n')
-                  f.write('RENDER_CRF=23\n')
-                  f.write('RENDER_AUDIO_BITRATE=128k\n')
+              s = rows[0] if rows else {}
+          except Exception:
+              s = {}
+          out = os.environ['GITHUB_ENV']
+          with open(out, 'a') as f:
+              f.write(f\"RENDER_FONT_SIZE={s.get('font_size', 42)}\n\")
+              f.write(f\"RENDER_MARGIN_V={s.get('margin_v', 14)}\n\")
+              f.write(f\"RENDER_OUTLINE={s.get('outline_width', 1)}\n\")
           " "$RESULT"
 
       - name: Convert SRT to ASS (fixes Sinhala conjunct shaping in libass)
@@ -196,52 +159,133 @@ jobs:
             --font-size "$RENDER_FONT_SIZE" \
             --margin-v "$RENDER_MARGIN_V" \
             --outline "$RENDER_OUTLINE"
-          cat subs.ass
+
+      - name: Upload subs.ass + font as shared artifact for the quality jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: prepared-subs
+          path: |
+            subs.ass
+            sinhala-font/NotoSansSinhala-Bold.ttf
+          retention-days: 1
+
+  # ============================================================
+  # JOB 2: Matrix - runs 3 TIMES IN PARALLEL (one per quality).
+  # Each downloads the video and the shared subs.ass independently,
+  # crops+burns+encodes+uploads its own quality, using a filename
+  # that includes the drama name, season and episode.
+  # ============================================================
+  burn:
+    needs: prepare-subs
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false   # one quality failing shouldn't cancel the others
+      matrix:
+        quality: [1080p, 720p, 480p]
+        include:
+          - quality: 1080p
+            scale: "1920:-2"
+          - quality: 720p
+            scale: "1280:-2"
+          - quality: 480p
+            scale: "854:-2"
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ inputs.chat_id }}
+      JOB_ID: ${{ inputs.job_id }}
+      OUT_NAME: ${{ needs.prepare-subs.outputs.safe_name }}_${{ matrix.quality }}.mp4
+    steps:
+      - name: Checkout repo (for scripts)
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          chmod +x scripts/report_status.sh
+
+      - name: Set up Python deps
+        run: pip install --quiet google-api-python-client google-auth requests Pillow
+
+      - name: Download prepared subs + font
+        uses: actions/download-artifact@v4
+        with:
+          name: prepared-subs
+
+      - name: Fetch render settings for ${{ matrix.quality }}
+        run: |
+          set -e
+          RESULT=$(curl -s "${SUPABASE_URL}/rest/v1/render_settings?quality=eq.${{ matrix.quality }}&select=*" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}")
+          python3 -c "
+          import json, sys, os
+          try:
+              rows = json.loads(sys.argv[1])
+              s = rows[0] if rows else {}
+          except Exception:
+              s = {}
+          out = os.environ['GITHUB_ENV']
+          with open(out, 'a') as f:
+              f.write(f\"RENDER_WATERMARK_TEXT={s.get('watermark_text', 'OnlyKSub')}\n\")
+              f.write(f\"RENDER_WATERMARK_OPACITY={s.get('watermark_opacity', 0.6)}\n\")
+              f.write(f\"RENDER_WATERMARK_FONTSIZE={s.get('watermark_fontsize', 16)}\n\")
+              f.write(f\"RENDER_CRF={s.get('crf', 23)}\n\")
+              f.write(f\"RENDER_AUDIO_BITRATE={s.get('audio_bitrate', '128k')}\n\")
+          " "$RESULT"
+
+      - name: Download video
+        run: |
+          set -e
+          ./scripts/report_status.sh "download_${{ matrix.quality }}" "started"
+          URL="${{ inputs.video_url }}"
+          if echo "$URL" | grep -q "pixeldrain.com/u/"; then
+            FILE_ID=$(echo "$URL" | sed -E 's#.*pixeldrain\.com/u/([a-zA-Z0-9]+).*#\1#')
+            URL="https://pixeldrain.com/api/file/${FILE_ID}"
+          fi
+          if ! curl -f -L -A "Mozilla/5.0" -e "https://pixeldrain.com/" -o input_video.mp4 "$URL"; then
+            ./scripts/report_status.sh "download_${{ matrix.quality }}" "failed"
+            exit 1
+          fi
+          ./scripts/report_status.sh "download_${{ matrix.quality }}" "success"
 
       - name: Detect and remove black bars (robust pixel-based auto-crop)
         run: |
           set -e
-          ./scripts/report_status.sh "crop_detect" "started"
           CROP=$(python3 scripts/detect_crop.py input_video.mp4 --threshold 24 --samples 30 | grep "^crop=" || true)
           if [ -z "$CROP" ]; then
-            echo "No reliable crop detected (or safety guard tripped), using full frame."
             echo "CROP_FILTER=" >> "$GITHUB_ENV"
-            ./scripts/report_status.sh "crop_detect" "success" '{"crop":"none - full frame used"}'
           else
-            echo "Detected: $CROP"
             echo "CROP_FILTER=${CROP}," >> "$GITHUB_ENV"
-            ./scripts/report_status.sh "crop_detect" "success" "{\"crop\":\"${CROP}\"}"
           fi
 
-      - name: Burn subtitles + watermark (native ffmpeg/libass - fast single-pass)
+      - name: Burn subtitles + watermark for ${{ matrix.quality }}
         run: |
           set -e
-          ./scripts/report_status.sh "burn" "started"
-          ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 input_video.mp4
-
-          WATERMARK_TEXT="${RENDER_WATERMARK_TEXT}"
+          ./scripts/report_status.sh "burn_${{ matrix.quality }}" "started"
           FONT_DIR=$(pwd)/sinhala-font
+          FONT_PATH="${FONT_DIR}/NotoSansSinhala-Bold.ttf"
 
-          FILTER="${CROP_FILTER}scale=-2:${RENDER_RESOLUTION_HEIGHT},ass=subs.ass:fontsdir=${FONT_DIR},"
-          FILTER="${FILTER}drawtext=text='${WATERMARK_TEXT}':fontfile=${SINHALA_FONT_PATH}:fontsize=${RENDER_WATERMARK_FONTSIZE}:fontcolor=white@${RENDER_WATERMARK_OPACITY}:borderw=1:bordercolor=black@0.5:x=w-tw-16:y=h-th-16"
+          FILTER="${CROP_FILTER}ass=subs.ass:fontsdir=${FONT_DIR},scale=${{ matrix.scale }},"
+          FILTER="${FILTER}drawtext=text='${RENDER_WATERMARK_TEXT}':fontfile=${FONT_PATH}:fontsize=${RENDER_WATERMARK_FONTSIZE}:fontcolor=white@${RENDER_WATERMARK_OPACITY}:borderw=1:bordercolor=black@0.5:x=w-tw-16:y=h-th-16"
 
           if ! ffmpeg -y -i input_video.mp4 \
             -vf "$FILTER" \
             -c:v libx264 -preset veryfast -crf "${RENDER_CRF}" -pix_fmt yuv420p \
             -c:a aac -b:a "${RENDER_AUDIO_BITRATE}" \
             -movflags +faststart \
-            output_final.mp4; then
-            ./scripts/report_status.sh "burn" "failed"
+            "$OUT_NAME"; then
+            ./scripts/report_status.sh "burn_${{ matrix.quality }}" "failed"
             exit 1
           fi
+          ./scripts/report_status.sh "burn_${{ matrix.quality }}" "success"
 
-          echo "--- Output resolution ---"
-          ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 output_final.mp4
-          ls -lh output_final.mp4
-          ./scripts/report_status.sh "burn" "success"
-
-      - name: Upload to Google Drive
+      - name: Upload to Google Drive (1080p only)
         id: drive
+        if: matrix.quality == '1080p'
         continue-on-error: true
         env:
           GDRIVE_SA_JSON_B64: ${{ secrets.GDRIVE_SA_JSON_B64 }}
@@ -250,69 +294,72 @@ jobs:
           set -e
           ./scripts/report_status.sh "upload_drive" "started"
           echo "$GDRIVE_SA_JSON_B64" | base64 -d > sa.json
-          if GDRIVE_SA_JSON=sa.json python scripts/upload_drive.py output_final.mp4; then
+          if GDRIVE_SA_JSON=sa.json python scripts/upload_drive.py "$OUT_NAME"; then
             echo "link=$(cat drive_link.txt)" >> "$GITHUB_OUTPUT"
             ./scripts/report_status.sh "upload_drive" "success" "{\"link\":\"$(cat drive_link.txt)\"}"
           else
             ./scripts/report_status.sh "upload_drive" "failed"
-            exit 1
           fi
 
       - name: Upload to Pixeldrain
         id: pixeldrain
-        continue-on-error: true
         env:
           PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
         run: |
           set -e
-          ./scripts/report_status.sh "upload_pixeldrain" "started"
-          if python scripts/upload_pixeldrain.py output_final.mp4; then
+          ./scripts/report_status.sh "upload_${{ matrix.quality }}" "started"
+          if python scripts/upload_pixeldrain.py "$OUT_NAME"; then
             echo "link=$(cat pixeldrain_link.txt)" >> "$GITHUB_OUTPUT"
-            ./scripts/report_status.sh "upload_pixeldrain" "success" "{\"link\":\"$(cat pixeldrain_link.txt)\"}"
+            ./scripts/report_status.sh "upload_${{ matrix.quality }}" "success" "{\"link\":\"$(cat pixeldrain_link.txt)\"}"
           else
-            ./scripts/report_status.sh "upload_pixeldrain" "failed"
+            ./scripts/report_status.sh "upload_${{ matrix.quality }}" "failed"
             exit 1
           fi
 
-      - name: Upload to VOE.sx
+      - name: Upload to VOE.sx (1080p only)
         id: voe
+        if: matrix.quality == '1080p'
         continue-on-error: true
         env:
           VOE_API_KEY: ${{ secrets.VOE_API_KEY }}
+          PIXELDRAIN_LINK: ${{ steps.pixeldrain.outputs.link }}
         run: |
-          set -e
           ./scripts/report_status.sh "upload_voe" "started"
-          PIXELDRAIN_LINK="${{ steps.pixeldrain.outputs.link }}"
           RESPONSE=$(curl -s "https://voe.sx/api/upload/url?key=${VOE_API_KEY}&url=${PIXELDRAIN_LINK}")
           echo "VOE upload response: $RESPONSE"
-          QUEUE_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['queueID'])")
-          echo "VOE queueID: $QUEUE_ID"
+          QUEUE_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',{}).get('queueID',''))" 2>/dev/null || echo "")
+
+          if [ -z "$QUEUE_ID" ]; then
+            echo "WARNING: VOE upload could not be queued (bad response), continuing without VOE link."
+            ./scripts/report_status.sh "upload_voe" "failed" "{\"reason\":\"no queueID in response\"}"
+            exit 0
+          fi
+
           for i in $(seq 1 90); do
             sleep 10
             STATUS=$(curl -s "https://voe.sx/api/upload/url/list?key=${VOE_API_KEY}&id=${QUEUE_ID}")
             PERCENT=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['list']['data'][0].get('percent', 0))" 2>/dev/null || echo "0")
             FILE_CODE=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['list']['data'][0].get('file_code', ''))" 2>/dev/null || echo "")
             echo "Attempt $i: percent=$PERCENT"
-            if [ "$PERCENT" = "100" ]; then
+            if [ "$PERCENT" = "100" ] && [ -n "$FILE_CODE" ]; then
               echo "link=https://voe.sx/e/${FILE_CODE}" >> "$GITHUB_OUTPUT"
               echo "VOE embed link ready: https://voe.sx/e/${FILE_CODE}"
               ./scripts/report_status.sh "upload_voe" "success" "{\"link\":\"https://voe.sx/e/${FILE_CODE}\"}"
               exit 0
             fi
           done
-          echo "VOE processing timed out"
+          echo "WARNING: VOE processing timed out, continuing without VOE link."
           ./scripts/report_status.sh "upload_voe" "failed" '{"reason":"timed out"}'
-          exit 1
 
-      - name: Notify website (webhook)
+      - name: Notify website (webhook) for ${{ matrix.quality }}
         if: always()
         continue-on-error: true
         env:
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
-          PIXELDRAIN_LINK: ${{ steps.pixeldrain.outputs.link }}
+          LINK: ${{ steps.pixeldrain.outputs.link }}
           VOE_LINK: ${{ steps.voe.outputs.link }}
         run: |
-          ./scripts/report_status.sh "webhook_notify" "started"
+          if [ -z "$LINK" ]; then exit 0; fi
           curl -s -X POST "https://onlyksub.vercel.app/api/webhook-hardcode-complete" \
             -H "Content-Type: application/json" \
             -H "x-webhook-secret: ${WEBHOOK_SECRET}" \
@@ -320,40 +367,26 @@ jobs:
               \"tmdb_id\": ${{ inputs.tmdb_id }},
               \"season_number\": ${{ inputs.season_number }},
               \"episode_number\": ${{ inputs.episode_number }},
-              \"pixeldrain_download_url\": \"${PIXELDRAIN_LINK}\",
+              \"pixeldrain_download_url\": \"${LINK}\",
               \"voe_embed_url\": \"${VOE_LINK}\",
-              \"quality\": \"${{ inputs.quality }}\"
-            }" \
-            && ./scripts/report_status.sh "webhook_notify" "success" \
-            || ./scripts/report_status.sh "webhook_notify" "failed"
+              \"quality\": \"${{ matrix.quality }}\"
+            }"
 
-      - name: Mark job done in dashboard
-        if: always()
-        run: |
-          if [ -n "$SUPABASE_URL" ] && [ -n "$JOB_ID" ]; then
-            FINAL_STATUS="done"
-            if [ "${{ job.status }}" != "success" ]; then FINAL_STATUS="failed"; fi
-            curl -s -o /dev/null -X PATCH "${SUPABASE_URL}/rest/v1/jobs?id=eq.${JOB_ID}" \
-              -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
-              -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
-              -H "Content-Type: application/json" \
-              -d "{\"status\":\"${FINAL_STATUS}\",\"finished_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"github_run_url\":\"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\",\"output_links\":{\"pixeldrain\":\"${{ steps.pixeldrain.outputs.link }}\",\"drive\":\"${{ steps.drive.outputs.link }}\",\"voe\":\"${{ steps.voe.outputs.link }}\"}}" \
-              || true
-          fi
-
-      - name: Notify on Telegram
+      - name: Notify on Telegram for ${{ matrix.quality }}
         if: always()
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ inputs.chat_id }}
-          DRIVE_LINK: ${{ steps.drive.outputs.link }}
-          PIXELDRAIN_LINK: ${{ steps.pixeldrain.outputs.link }}
+          LINK: ${{ steps.pixeldrain.outputs.link }}
+          VOE_LINK: ${{ steps.voe.outputs.link }}
         run: |
-          TEXT="🎉 Done!"$'\n'
-          if [ -n "$DRIVE_LINK" ]; then TEXT="${TEXT}"$'\n'"📁 Drive: ${DRIVE_LINK}"; fi
-          if [ -n "$PIXELDRAIN_LINK" ]; then TEXT="${TEXT}"$'\n'"📥 Pixeldrain: ${PIXELDRAIN_LINK}"; fi
-          if [ -z "$DRIVE_LINK" ] && [ -z "$PIXELDRAIN_LINK" ]; then
-            TEXT="❌ All uploads failed. Check the GitHub Actions log."
+          if [ -n "$LINK" ]; then
+            TEXT="✅ ${{ inputs.drama_name }} S${{ inputs.season_number }}E${{ inputs.episode_number }} (${{ matrix.quality }}) done! 📥 ${LINK}"
+            if [ -n "$VOE_LINK" ]; then
+              TEXT="${TEXT}"$'\n'"🎬 VOE: ${VOE_LINK}"
+            fi
+          else
+            TEXT="❌ ${{ inputs.drama_name }} S${{ inputs.season_number }}E${{ inputs.episode_number }} (${{ matrix.quality }}) failed. Check the GitHub Actions log."
           fi
           curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             -d chat_id="${CHAT_ID}" \
@@ -363,6 +396,32 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: burned-video
-          path: output_final.mp4
+          name: burned-video-${{ matrix.quality }}
+          path: ${{ env.OUT_NAME }}
           retention-days: 3
+
+  # ============================================================
+  # JOB 3: Runs once ALL 3 quality jobs finish (success or fail).
+  # Marks the Supabase job row as done.
+  # ============================================================
+  finalize:
+    needs: burn
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark job done in dashboard
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          if [ -n "$SUPABASE_URL" ] && [ -n "$JOB_ID" ]; then
+            FINAL_STATUS="done"
+            if [ "${{ needs.burn.result }}" != "success" ]; then FINAL_STATUS="failed"; fi
+            curl -s -o /dev/null -X PATCH "${SUPABASE_URL}/rest/v1/jobs?id=eq.${JOB_ID}" \
+              -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+              -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+              -H "Content-Type: application/json" \
+              -d "{\"status\":\"${FINAL_STATUS}\",\"finished_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"github_run_url\":\"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"}" \
+              || true
+          fi

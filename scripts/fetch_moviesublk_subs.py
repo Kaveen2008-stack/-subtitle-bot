@@ -74,9 +74,24 @@ import urllib.parse
 
 import requests
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": USER_AGENT})
+SESSION.headers.update({
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.moviesublk.com/",
+})
+
+# Matches Blogger's search-page post links, e.g.:
+#   <h3 class='post-title entry-title' ...><a href='https://www.moviesublk.com/2026/08/xxx.html'>Title</a></h3>
+HTML_SEARCH_LINK_RE = re.compile(
+    r'<a[^>]+href=["\'](https://www\.moviesublk\.com/\d{4}/\d{2}/[^"\']+\.html)["\'][^>]*>(.*?)</a>',
+    re.DOTALL,
+)
 
 SERIES_DATA_RE = re.compile(r"const\s+seriesData\s*=\s*(\{.*?\});", re.DOTALL)
 MEDIAFIRE_DOWNLOAD_RE = re.compile(
@@ -92,15 +107,12 @@ MEDIAFIRE_DOWNLOAD_RE_ALT = re.compile(
 # ---------------------------------------------------------------------
 # STEP 1: search via Blogger's public JSON feed (no HTML scraping)
 # ---------------------------------------------------------------------
-def search_posts(query: str, max_results: int = 8):
-    """Search moviesublk.com posts by title/content via Blogger's JSON
-    feed API. Returns list of {title, url, published}."""
+def _search_via_feed(query: str, max_results: int):
+    """Try Blogger's JSON feed API. Some Blogger sites block this with a
+    403 (feed disabled / bot-protection), in which case the caller
+    should fall back to _search_via_html_page()."""
     url = "https://www.moviesublk.com/feeds/posts/default"
-    params = {
-        "q": query,
-        "alt": "json",
-        "max-results": max_results,
-    }
+    params = {"q": query, "alt": "json", "max-results": max_results}
     resp = SESSION.get(url, params=params, timeout=20)
     resp.raise_for_status()
     data = resp.json()
@@ -118,6 +130,53 @@ def search_posts(query: str, max_results: int = 8):
         if link:
             results.append({"title": title, "url": link, "published": published})
     return results
+
+
+def _strip_html_tags(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text).strip()
+
+
+def _search_via_html_page(query: str, max_results: int):
+    """Fallback: scrape Blogger's own /search?q=... results page and
+    regex out post links + titles. Used when the JSON feed is blocked."""
+    url = "https://www.moviesublk.com/search"
+    resp = SESSION.get(url, params={"q": query}, timeout=20)
+    resp.raise_for_status()
+    html = resp.text
+
+    seen = set()
+    results = []
+    for m in HTML_SEARCH_LINK_RE.finditer(html):
+        link, title_html = m.group(1), m.group(2)
+        title = _strip_html_tags(title_html)
+        if not title or link in seen:
+            continue
+        seen.add(link)
+        results.append({"title": title, "url": link, "published": ""})
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def search_posts(query: str, max_results: int = 8):
+    """Search moviesublk.com posts by title. Tries the Blogger JSON feed
+    API first (cleaner, no HTML parsing); if that's blocked (403/etc),
+    falls back to scraping the site's own /search?q= results page."""
+    try:
+        results = _search_via_feed(query, max_results)
+        if results:
+            return results
+        # Feed responded fine but had zero hits - still worth trying the
+        # HTML search page since Blogger's own search sometimes matches
+        # content that the feed's `q=` filter misses.
+    except requests.exceptions.HTTPError as e:
+        print(f"  (JSON feed search blocked: {e}; falling back to HTML search page)",
+              file=sys.stderr)
+    except Exception as e:
+        print(f"  (JSON feed search failed: {e}; falling back to HTML search page)",
+              file=sys.stderr)
+
+    return _search_via_html_page(query, max_results)
 
 
 # ---------------------------------------------------------------------

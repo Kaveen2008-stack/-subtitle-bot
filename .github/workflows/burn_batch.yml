@@ -318,13 +318,7 @@ jobs:
           FONT_DIR=$(pwd)/sinhala-font
           FONT_PATH="${FONT_DIR}/NotoSansSinhala-Bold.ttf"
 
-          DRAMA_NAME="${{ inputs.drama_name }}"
-          if [ -n "$DRAMA_NAME" ]; then
-            WATERMARK_TEXT="${DRAMA_NAME} EP${{ matrix.episode.episode_number }} - ${RENDER_WATERMARK_TEXT}"
-          else
-            WATERMARK_TEXT="${RENDER_WATERMARK_TEXT}"
-          fi
-          WATERMARK_TEXT=$(echo "$WATERMARK_TEXT" | sed "s/'/\\\\'/g" | sed "s/:/\\\\:/g")
+          WATERMARK_TEXT=$(echo "$RENDER_WATERMARK_TEXT" | sed "s/'/\\\\'/g" | sed "s/:/\\\\:/g")
 
           FILTER="${CROP_FILTER}ass=subs.ass:fontsdir=${FONT_DIR},scale=${{ matrix.scale }},"
           FILTER="${FILTER}drawtext=text='${WATERMARK_TEXT}':fontfile=${FONT_PATH}:fontsize=${RENDER_WATERMARK_FONTSIZE}:fontcolor=white@${RENDER_WATERMARK_OPACITY}:borderw=1:bordercolor=black@0.5:x=w-tw-16:y=h-th-16"

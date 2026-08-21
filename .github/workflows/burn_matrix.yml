@@ -107,10 +107,6 @@ jobs:
         if: inputs.sub_type != 'english' && inputs.sub_format != 'ass'
         run: cp subs_cleaned.srt subs.srt
 
-      - name: Use ASS as-is (skip translation/conversion)
-        if: inputs.sub_format == 'ass'
-        run: cp subs_raw.ass subs.ass
-
       - name: Fetch render settings (uses 1080p row for font/margin/outline - shared across qualities)
         run: |
           set -e
@@ -139,6 +135,18 @@ jobs:
             --font-size "$RENDER_FONT_SIZE" \
             --margin-v "$RENDER_MARGIN_V" \
             --outline "$RENDER_OUTLINE"
+
+      - name: Clean uploaded ASS (strip source-site credits, force installed font)
+        if: inputs.sub_format == 'ass'
+        run: |
+          set -e
+          python scripts/clean_ass.py subs_raw.ass subs.ass "$SINHALA_FONT_NAME" \
+            --font-size "$RENDER_FONT_SIZE" \
+            --margin-v "$RENDER_MARGIN_V" \
+            --outline "$RENDER_OUTLINE"
+
+      - name: Add OnlyKsub intro credit (first 3s of every video)
+        run: python scripts/add_intro_credit.py subs.ass "$SINHALA_FONT_NAME" --seconds 3
 
       - name: Upload subs.ass + font as shared artifact for the quality jobs
         uses: actions/upload-artifact@v4
@@ -240,6 +248,12 @@ jobs:
           else
             echo "CROP_FILTER=${CROP}," >> "$GITHUB_ENV"
           fi
+
+      - name: Inject OnlyKsub site credit (start + end)
+        run: |
+          set -e
+          DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 input_video.mp4)
+          python3 scripts/inject_credits.py subs.ass "$DURATION" "Noto Sans Sinhala"
 
       - name: Burn subtitles + watermark for ${{ matrix.quality }}
         run: |

@@ -52,6 +52,10 @@ jobs:
   # so both matrix jobs below can fan out on them. No archive
   # download/extraction - each episode already has a direct URL.
   # ============================================================
+  # ============================================================
+  # JOB 1: Parses episodes_json + qualities_json so both matrix
+  # jobs below can fan out on them.
+  # ============================================================
   plan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -61,24 +65,38 @@ jobs:
     steps:
       - name: Parse episodes_json + qualities_json
         id: parse
+        env:
+          EPISODES_JSON: ${{ inputs.episodes_json }}
+          QUALITIES_JSON: ${{ inputs.qualities_json }}
         run: |
           set -e
-          python3 -c "
-          import json
-          episodes = json.loads('''${{ inputs.episodes_json }}''')
-          for e in episodes:
-              assert 'episode_number' in e and 'video_url' in e and 'srt_url' in e, f'bad entry: {e}'
-          print(f'{len(episodes)} episode(s) planned')
-          "
-          echo "episodes=${{ toJson(fromJson(inputs.episodes_json)) }}" >> "$GITHUB_OUTPUT"
-          echo "qualities=${{ toJson(fromJson(inputs.qualities_json)) }}" >> "$GITHUB_OUTPUT"
+          python3 << 'PYEOF'
+          import json, os
 
-  # ============================================================
-  # JOB 2: Matrix over episodes (parallel, one runner each).
-  # Downloads/cleans/translates the srt (Gemini - expensive, must
-  # not be duplicated per quality) and converts to ASS once per
-  # episode. Shared by every quality job for that episode.
-  # ============================================================
+          episodes_raw = os.environ["EPISODES_JSON"]
+          qualities_raw = os.environ["QUALITIES_JSON"]
+
+          episodes = json.loads(episodes_raw)
+          qualities = json.loads(qualities_raw)
+
+          if not isinstance(episodes, list) or len(episodes) == 0:
+              raise SystemExit("episodes_json must be a non-empty JSON array")
+
+          for e in episodes:
+              missing = [k for k in ("episode_number", "video_url", "srt_url") if k not in e]
+              if missing:
+                  raise SystemExit(f"bad entry (missing {missing}): {e}")
+
+          print(f"{len(episodes)} episode(s) planned, qualities={qualities}")
+
+          episodes_out = json.dumps(episodes, separators=(",", ":"))
+          qualities_out = json.dumps(qualities, separators=(",", ":"))
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"episodes={episodes_out}\n")
+              out.write(f"qualities={qualities_out}\n")
+          PYEOF
+
   prepare-subs:
     needs: plan
     runs-on: ubuntu-latest

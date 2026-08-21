@@ -191,9 +191,6 @@ jobs:
           python scripts/clean_ass.py subs_raw.ass subs.ass "$SINHALA_FONT_NAME" \
             --font-size "$RENDER_FONT_SIZE" --margin-v "$RENDER_MARGIN_V" --outline "$RENDER_OUTLINE"
 
-      - name: Add OnlyKsub intro credit (first 3s of every episode)
-        run: python scripts/add_intro_credit.py subs.ass "$SINHALA_FONT_NAME" --seconds 3
-
       - name: Upload subs.ass + font as per-episode shared artifact
         uses: actions/upload-artifact@v4
         with:

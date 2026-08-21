@@ -165,9 +165,6 @@ jobs:
             --margin-v "$RENDER_MARGIN_V" \
             --outline "$RENDER_OUTLINE"
 
-      - name: Add OnlyKsub intro credit (first 3s of every video)
-        run: python scripts/add_intro_credit.py subs.ass "$SINHALA_FONT_NAME" --seconds 3
-
       - name: Upload subs.ass + font as shared artifact for the quality jobs
         uses: actions/upload-artifact@v4
         with:

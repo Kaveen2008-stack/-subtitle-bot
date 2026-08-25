@@ -156,9 +156,11 @@ jobs:
         run: |
           set -e
           python3 scripts/plan_season_uploads.py matched_episodes.json episode_plan.json
-          echo "episodes<<EOF" >> "$GITHUB_OUTPUT"
+          DELIM="EOF_$(date +%s%N)"
+          echo "episodes<<$DELIM" >> "$GITHUB_OUTPUT"
           cat episode_plan.json >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
           echo "--- Final planned episodes (video + srt both confirmed) ---"
           cat episode_plan.json
 

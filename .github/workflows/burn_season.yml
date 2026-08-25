@@ -109,11 +109,18 @@ jobs:
           find videos_extracted -type f
 
       - name: Download individually-provided srt files
+        env:
+          # Passed via env instead of interpolated directly into the
+          # python string - direct ${{ }} substitution happens BEFORE the
+          # script runs, so quote/newline characters in the JSON can
+          # corrupt the script itself (this caused JSONDecodeError
+          # elsewhere in this repo). Env vars carry the value as-is.
+          SRT_FILES_JSON: ${{ inputs.srt_files_json }}
         run: |
           set -e
           python3 -c "
           import json, os
-          srt_list = json.loads('''${{ inputs.srt_files_json }}''')
+          srt_list = json.loads(os.environ['SRT_FILES_JSON'])
           os.makedirs('srt_by_episode', exist_ok=True)
           episodes = [str(item['episode_number']) for item in srt_list]
           with open('wanted_episodes.txt', 'w') as f:
@@ -273,6 +280,17 @@ jobs:
     needs: [extract-and-plan, prepare-subs]
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # Local Telegram Bot API server - lets us upload up to 2GB per video
+    # using the SAME bot token, instead of the normal 50MB limit that
+    # applies when talking to api.telegram.org directly.
+    services:
+      telegram-bot-api:
+        image: aiogram/telegram-bot-api:latest
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        ports:
+          - 8081:8081
     strategy:
       fail-fast: false
       max-parallel: 10
@@ -378,6 +396,31 @@ jobs:
           python scripts/upload_pixeldrain.py output.mp4
           echo "link=$(cat pixeldrain_link.txt)" >> "$GITHUB_OUTPUT"
 
+      - name: Wait for local Telegram Bot API server
+        run: |
+          for i in $(seq 1 30); do
+            if curl -s -o /dev/null "http://localhost:8081"; then
+              echo "Local Bot API server is up."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "WARNING: local Bot API server did not come up in time, Telegram upload will likely fail."
+
+      - name: Upload to Telegram (local Bot API, up to 2GB)
+        id: telegram
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+        run: |
+          CAPTION="S${{ inputs.season_number }}E${{ matrix.episode.episode_number }} (${{ matrix.quality }}) - OnlyKsub"
+          if python scripts/upload_telegram_local.py output.mp4 "$CAPTION"; then
+            echo "link=$(cat telegram_link.txt)" >> "$GITHUB_OUTPUT"
+          else
+            echo "WARNING: Telegram upload failed, continuing without it."
+          fi
+
       - name: Upload to VOE.sx (1080p only)
         id: voe
         if: matrix.quality == '1080p'
@@ -412,6 +455,13 @@ jobs:
       - name: Notify website (webhook)
         continue-on-error: true
         env:
+          # This GH secret's NAME doesn't need to match Vercel's env var
+          # name (HARDCODE_WEBHOOK_SECRET) - only the VALUE has to match,
+          # since it's just sent as a header. Verify: GitHub repo secret
+          # "WEBHOOK_SECRET" must contain the exact same value as Vercel's
+          # "HARDCODE_WEBHOOK_SECRET" env var, or the webhook silently
+          # 401s (this step has continue-on-error, so the workflow still
+          # shows green even when this fails).
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
           LINK: ${{ steps.pixeldrain.outputs.link }}
           VOE_LINK: ${{ steps.voe.outputs.link }}

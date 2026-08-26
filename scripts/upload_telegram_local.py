@@ -19,6 +19,7 @@ Optional:
 """
 import os
 import sys
+import time
 import requests
 
 
@@ -34,6 +35,21 @@ def build_message_link(channel_id: str, message_id: int) -> str:
     return f"chat={channel_id} message_id={message_id}"
 
 
+def upload_once(url, channel_id, caption, file_path):
+    with open(file_path, "rb") as f:
+        resp = requests.post(
+            url,
+            data={
+                "chat_id": channel_id,
+                "caption": caption,
+                "supports_streaming": True,
+            },
+            files={"video": f},
+            timeout=3600,
+        )
+    return resp
+
+
 def main():
     file_path = sys.argv[1]
     caption = sys.argv[2] if len(sys.argv) > 2 else ""
@@ -47,30 +63,59 @@ def main():
     file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
     print(f"Uploading {file_path} ({file_size_mb:.1f} MB) to Telegram via local Bot API server...")
 
-    with open(file_path, "rb") as f:
-        resp = requests.post(
-            url,
-            data={
-                "chat_id": channel_id,
-                "caption": caption,
-                "supports_streaming": True,
-            },
-            files={"video": f},
-            timeout=3600,
-        )
+    max_attempts = 6
+    backoff = 5  # seconds, doubles each attempt (capped)
 
-    data = resp.json()
-    if not data.get("ok"):
-        print(f"Telegram upload failed: {data}", file=sys.stderr)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = upload_once(url, channel_id, caption, file_path)
+        except requests.exceptions.RequestException as e:
+            print(f"Attempt {attempt}/{max_attempts}: network error ({e}), retrying in {backoff}s...", file=sys.stderr)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 120)
+            continue
+
+        try:
+            data = resp.json()
+        except ValueError:
+            print(f"Attempt {attempt}/{max_attempts}: non-JSON response (HTTP {resp.status_code}), retrying in {backoff}s...", file=sys.stderr)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 120)
+            continue
+
+        if data.get("ok"):
+            message_id = data["result"]["message_id"]
+            link = build_message_link(channel_id, message_id)
+            with open("telegram_link.txt", "w") as f:
+                f.write(link)
+            print(f"Uploaded successfully: {link}")
+            return
+
+        # Telegram flood control (429) - honor the retry_after it tells us
+        retry_after = None
+        if resp.status_code == 429 or data.get("error_code") == 429:
+            retry_after = (data.get("parameters") or {}).get("retry_after")
+
+        if retry_after:
+            wait_s = int(retry_after) + 1
+            print(f"Attempt {attempt}/{max_attempts}: flood control, Telegram asked us to wait {wait_s}s...", file=sys.stderr)
+            time.sleep(wait_s)
+            continue
+
+        # 5xx server errors are usually transient - retry with backoff
+        if resp.status_code >= 500:
+            print(f"Attempt {attempt}/{max_attempts}: server error (HTTP {resp.status_code}): {data}, retrying in {backoff}s...", file=sys.stderr)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 120)
+            continue
+
+        # Anything else (bad request, invalid chat, etc.) won't be fixed by
+        # retrying - fail fast so we don't waste 6 attempts on a real bug.
+        print(f"Telegram upload failed (non-retryable): {data}", file=sys.stderr)
         sys.exit(1)
 
-    message_id = data["result"]["message_id"]
-    link = build_message_link(channel_id, message_id)
-
-    with open("telegram_link.txt", "w") as f:
-        f.write(link)
-
-    print(f"Uploaded successfully: {link}")
+    print(f"Telegram upload failed after {max_attempts} attempts.", file=sys.stderr)
+    sys.exit(1)
 
 
 if __name__ == "__main__":

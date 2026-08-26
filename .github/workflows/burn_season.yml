@@ -27,6 +27,11 @@ on:
         description: "Season number"
         required: true
         type: string
+      qualities_json:
+        description: 'JSON array of qualities to render, e.g. ["720p","480p"]. Defaults to all 3.'
+        required: false
+        type: string
+        default: '["1080p","720p","480p"]'
 
 concurrency:
   group: burn-season-${{ inputs.chat_id }}-${{ inputs.tmdb_id }}-${{ inputs.season_number }}
@@ -46,6 +51,7 @@ jobs:
     timeout-minutes: 60
     outputs:
       episodes: ${{ steps.plan.outputs.episodes }}
+      telegram_quality: ${{ steps.telegram-quality.outputs.telegram_quality }}
     steps:
       - name: Checkout repo (for scripts)
         uses: actions/checkout@v4
@@ -170,6 +176,21 @@ jobs:
           path: srt_by_episode/
           retention-days: 1
 
+      - name: Compute best quality for Telegram/Drive/VOE upload
+        id: telegram-quality
+        env:
+          QUALITIES_JSON: ${{ inputs.qualities_json }}
+        run: |
+          python3 -c "
+          import json, os
+          qualities = json.loads(os.environ['QUALITIES_JSON'])
+          priority = ['1080p', '720p', '480p']
+          best = next((q for q in priority if q in qualities), qualities[0] if qualities else '')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'telegram_quality={best}\n')
+          print(f'telegram_quality={best}')
+          "
+
       - name: Send match report to Telegram for review
         if: always()
         env:
@@ -195,7 +216,7 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      max-parallel: 10
+      max-parallel: 20
       matrix:
         episode: ${{ fromJson(needs.extract-and-plan.outputs.episodes) }}
     env:
@@ -275,7 +296,7 @@ jobs:
   # ============================================================
   # JOB 3: Matrix over episode x quality (built-in cross product).
   # Runs TRUE PARALLEL across separate runners, capped at
-  # max-parallel: 10 concurrent jobs. Runs automatically once prepare-subs
+  # max-parallel: 20 concurrent jobs (GitHub free-tier cap). Runs automatically once prepare-subs
   # finishes - no manual approval step.
   # ============================================================
   burn:
@@ -295,10 +316,10 @@ jobs:
           - 8081:8081
     strategy:
       fail-fast: false
-      max-parallel: 10
+      max-parallel: 20
       matrix:
         episode: ${{ fromJson(needs.extract-and-plan.outputs.episodes) }}
-        quality: [1080p, 720p, 480p]
+        quality: ${{ fromJson(inputs.qualities_json) }}
         include:
           - quality: 1080p
             scale: "1920:-2"
@@ -409,8 +430,9 @@ jobs:
           done
           echo "WARNING: local Bot API server did not come up in time, Telegram upload will likely fail."
 
-      - name: Upload to Telegram (local Bot API, up to 2GB)
+      - name: Upload to Telegram (local Bot API, up to 2GB, 1080p only to reduce flood risk)
         id: telegram
+        if: matrix.quality == needs.extract-and-plan.outputs.telegram_quality
         continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -425,7 +447,7 @@ jobs:
 
       - name: Upload to VOE.sx (1080p only)
         id: voe
-        if: matrix.quality == '1080p'
+        if: matrix.quality == needs.extract-and-plan.outputs.telegram_quality
         continue-on-error: true
         env:
           VOE_API_KEY: ${{ secrets.VOE_API_KEY }}

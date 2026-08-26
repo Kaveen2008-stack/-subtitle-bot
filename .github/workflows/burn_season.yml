@@ -303,17 +303,6 @@ jobs:
     needs: [extract-and-plan, prepare-subs]
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    # Local Telegram Bot API server - lets us upload up to 2GB per video
-    # using the SAME bot token, instead of the normal 50MB limit that
-    # applies when talking to api.telegram.org directly.
-    services:
-      telegram-bot-api:
-        image: aiogram/telegram-bot-api:latest
-        env:
-          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-        ports:
-          - 8081:8081
     strategy:
       fail-fast: false
       max-parallel: 20
@@ -419,31 +408,19 @@ jobs:
           python scripts/upload_pixeldrain.py output.mp4
           echo "link=$(cat pixeldrain_link.txt)" >> "$GITHUB_OUTPUT"
 
-      - name: Wait for local Telegram Bot API server
-        run: |
-          for i in $(seq 1 30); do
-            if curl -s -o /dev/null "http://localhost:8081"; then
-              echo "Local Bot API server is up."
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "WARNING: local Bot API server did not come up in time, Telegram upload will likely fail."
-
-      - name: Upload to Telegram (local Bot API, up to 2GB, 1080p only to reduce flood risk)
-        id: telegram
+      - name: Save 1080p video for later sequential Telegram upload
+        # Telegram upload moved OUT of this concurrent matrix job (see the
+        # separate upload-telegram job below). Uploading from 20+ parallel
+        # matrix runners on the SAME bot token triggers Telegram's flood
+        # control (retry_after can be 3000+ seconds) since it looks like
+        # abuse from Telegram's side. Sequential, one-at-a-time uploads
+        # after all burns finish avoids that entirely.
         if: matrix.quality == needs.extract-and-plan.outputs.telegram_quality
-        continue-on-error: true
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
-        run: |
-          CAPTION="S${{ inputs.season_number }}E${{ matrix.episode.episode_number }} (${{ matrix.quality }}) - OnlyKsub"
-          if python scripts/upload_telegram_local.py output.mp4 "$CAPTION"; then
-            echo "link=$(cat telegram_link.txt)" >> "$GITHUB_OUTPUT"
-          else
-            echo "WARNING: Telegram upload failed, continuing without it."
-          fi
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-pending-ep${{ matrix.episode.episode_number }}
+          path: output.mp4
+          retention-days: 1
 
       - name: Upload to VOE.sx (1080p only)
         id: voe
@@ -522,10 +499,77 @@ jobs:
             -d chat_id="${CHAT_ID}" --data-urlencode text="${TEXT}"
 
   # ============================================================
+  # JOB 3.5: Uploads every episode's 1080p video to Telegram ONE
+  # AT A TIME, on a single runner - not a matrix. Doing this
+  # concurrently (20+ matrix jobs sharing one bot token) triggers
+  # Telegram's flood control, which can impose a multi-thousand-
+  # second penalty on the whole bot. Sequential uploads with a
+  # short delay between each avoids that entirely.
+  # ============================================================
+  upload-telegram:
+    needs: [extract-and-plan, burn]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    services:
+      telegram-bot-api:
+        image: aiogram/telegram-bot-api:latest
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        ports:
+          - 8081:8081
+    steps:
+      - name: Checkout repo (for scripts)
+        uses: actions/checkout@v4
+
+      - name: Set up Python deps
+        run: pip install --quiet requests
+
+      - name: Wait for local Telegram Bot API server
+        run: |
+          for i in $(seq 1 30); do
+            if curl -s -o /dev/null "http://localhost:8081"; then
+              echo "Local Bot API server is up."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "WARNING: local Bot API server did not come up in time."
+
+      - name: Upload each episode's 1080p video sequentially
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+        run: |
+          set +e  # one episode's failure shouldn't stop the rest
+          echo '${{ needs.extract-and-plan.outputs.episodes }}' > episodes.json
+          EPISODES=$(python3 -c "import json; print(' '.join(str(e['episode_number']) for e in json.load(open('episodes.json'))))")
+
+          for EP in $EPISODES; do
+            echo "=== Episode $EP ==="
+            ARTIFACT_NAME="telegram-pending-ep${EP}"
+            rm -rf dl && mkdir dl
+            if ! gh run download "${{ github.run_id }}" --name "$ARTIFACT_NAME" --dir dl 2>/dev/null; then
+              echo "No artifact found for episode $EP (burn may have failed) - skipping."
+              continue
+            fi
+            CAPTION="S${{ inputs.season_number }}E${EP} (1080p) - OnlyKsub"
+            if python scripts/upload_telegram_local.py "dl/output.mp4" "$CAPTION"; then
+              echo "Episode $EP uploaded: $(cat telegram_link.txt)"
+            else
+              echo "WARNING: Episode $EP Telegram upload failed."
+            fi
+            echo "Waiting 15s before next upload (flood control safety margin)..."
+            sleep 15
+          done
+
+  # ============================================================
   # JOB 4: Final summary once everything finishes.
   # ============================================================
   finalize:
-    needs: burn
+    needs: [burn, upload-telegram]
     if: always()
     runs-on: ubuntu-latest
     steps:

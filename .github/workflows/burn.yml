@@ -73,12 +73,15 @@ jobs:
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
     outputs:
       safe_name: ${{ steps.name.outputs.safe_name }}
+      telegram_quality: ${{ steps.name.outputs.telegram_quality }}
     steps:
       - name: Checkout repo (for scripts)
         uses: actions/checkout@v4
 
       - name: Build sanitized output name (drama_S<season>E<episode>)
         id: name
+        env:
+          QUALITIES_JSON: ${{ inputs.qualities_json }}
         run: |
           set -e
           RAW="${{ inputs.drama_name }}_S${{ inputs.season_number }}E${{ inputs.episode_number }}"
@@ -86,6 +89,19 @@ jobs:
           SAFE=$(echo "$RAW" | tr ' ' '_' | tr -cd '[:alnum:]_-')
           echo "safe_name=${SAFE}" >> "$GITHUB_OUTPUT"
           echo "Output basename will be: ${SAFE}_<quality>.mp4"
+
+          # Telegram/Drive/VOE only get ONE quality (the best one actually
+          # selected) - don't hardcode 1080p, some sources only have
+          # 720p/480p available.
+          python3 -c "
+          import json, os
+          qualities = json.loads(os.environ['QUALITIES_JSON'])
+          priority = ['1080p', '720p', '480p']
+          best = next((q for q in priority if q in qualities), qualities[0] if qualities else '')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'telegram_quality={best}\n')
+          print(f'telegram_quality={best}')
+          "
 
       - name: Install Sinhala font (Noto Sans Sinhala)
         run: |
@@ -312,7 +328,7 @@ jobs:
 
       - name: Upload to Google Drive (1080p only)
         id: drive
-        if: matrix.quality == '1080p'
+        if: matrix.quality == needs.prepare-subs.outputs.telegram_quality
         continue-on-error: true
         env:
           GDRIVE_SA_JSON_B64: ${{ secrets.GDRIVE_SA_JSON_B64 }}
@@ -354,8 +370,9 @@ jobs:
           done
           echo "WARNING: local Bot API server did not come up in time, Telegram upload will likely fail."
 
-      - name: Upload to Telegram (local Bot API, up to 2GB)
+      - name: Upload to Telegram (local Bot API, up to 2GB, 1080p only to reduce flood risk)
         id: telegram
+        if: matrix.quality == needs.prepare-subs.outputs.telegram_quality
         continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -370,7 +387,7 @@ jobs:
 
       - name: Upload to VOE.sx (1080p only)
         id: voe
-        if: matrix.quality == '1080p'
+        if: matrix.quality == needs.prepare-subs.outputs.telegram_quality
         continue-on-error: true
         env:
           VOE_API_KEY: ${{ secrets.VOE_API_KEY }}

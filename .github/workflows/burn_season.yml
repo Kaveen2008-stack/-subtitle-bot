@@ -36,6 +36,11 @@ on:
         required: false
         type: string
         default: '["1080p","720p","480p"]'
+      sub_format:
+        description: "Subtitle format uploaded: srt or ass"
+        required: false
+        type: string
+        default: "srt"
 
 concurrency:
   group: burn-season-${{ inputs.chat_id }}-${{ inputs.tmdb_id }}-${{ inputs.season_number }}
@@ -118,7 +123,7 @@ jobs:
           echo "--- Extracted files ---"
           find videos_extracted -type f
 
-      - name: Download individually-provided srt files
+      - name: Download individually-provided subtitle files
         env:
           # Passed via env instead of interpolated directly into the
           # python string - direct ${{ }} substitution happens BEFORE the
@@ -126,6 +131,7 @@ jobs:
           # corrupt the script itself (this caused JSONDecodeError
           # elsewhere in this repo). Env vars carry the value as-is.
           SRT_FILES_JSON: ${{ inputs.srt_files_json }}
+          SUB_EXT: ${{ inputs.sub_format }}
         run: |
           set -e
           python3 -c "
@@ -139,18 +145,19 @@ jobs:
               json.dump(srt_list, f)
           print(f'{len(srt_list)} subtitle entries received')
           "
+          if [ -z "$SUB_EXT" ]; then SUB_EXT="srt"; fi
           while IFS= read -r line; do
             EP=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['episode_number'])")
             URL=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['srt_url'])")
-            echo "Downloading srt for episode $EP..."
-            curl -f -L -o "srt_by_episode/ep${EP}.srt" "$URL"
+            echo "Downloading subtitle for episode $EP..."
+            curl -f -L -o "srt_by_episode/ep${EP}.${SUB_EXT}" "$URL"
           done < <(python3 -c "
           import json
           with open('srt_list.json') as f:
               for item in json.load(f):
                   print(json.dumps(item))
           ")
-          echo "--- Downloaded srt files ---"
+          echo "--- Downloaded subtitle files ---"
           ls -la srt_by_episode/
 
       - name: Match videos to episodes that have subtitles
@@ -250,11 +257,22 @@ jobs:
           name: season-srts
           path: srt_by_episode
 
-      - name: Clean subtitle
-        run: python scripts/clean_srt.py "srt_by_episode/ep${{ matrix.episode.episode_number }}.srt" subs_cleaned.srt
+      - name: Prep subtitle for this episode (clean / translate / convert)
+        run: |
+          set -e
+          EXT="${{ inputs.sub_format }}"
+          if [ -z "$EXT" ]; then EXT="srt"; fi
+          EP="${{ matrix.episode.episode_number }}"
+          SRC="srt_by_episode/ep${EP}.${EXT}"
+
+          if [ "$EXT" = "ass" ]; then
+            cp "$SRC" subs_raw.ass
+          else
+            python scripts/clean_srt.py "$SRC" subs_cleaned.srt
+          fi
 
       - name: Translate to Sinhala (only if needed)
-        if: inputs.sub_type == 'english'
+        if: inputs.sub_type == 'english' && inputs.sub_format != 'ass'
         env:
           GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
@@ -264,7 +282,7 @@ jobs:
         run: python scripts/translate.py subs_cleaned.srt subs.srt
 
       - name: Use cleaned sub as-is (already Sinhala)
-        if: inputs.sub_type != 'english'
+        if: inputs.sub_type != 'english' && inputs.sub_format != 'ass'
         run: cp subs_cleaned.srt subs.srt
 
       - name: Fetch render settings
@@ -287,8 +305,15 @@ jobs:
           " "$RESULT"
 
       - name: Convert SRT to ASS
+        if: inputs.sub_format != 'ass'
         run: |
           python scripts/srt_to_ass.py subs.srt subs.ass "$SINHALA_FONT_NAME" \
+            --font-size "$RENDER_FONT_SIZE" --margin-v "$RENDER_MARGIN_V" --outline "$RENDER_OUTLINE"
+
+      - name: Clean uploaded ASS (strip source-site credits, force installed font)
+        if: inputs.sub_format == 'ass'
+        run: |
+          python scripts/clean_ass.py subs_raw.ass subs.ass "$SINHALA_FONT_NAME" \
             --font-size "$RENDER_FONT_SIZE" --margin-v "$RENDER_MARGIN_V" --outline "$RENDER_OUTLINE"
 
       - uses: actions/upload-artifact@v4

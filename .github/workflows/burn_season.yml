@@ -416,6 +416,12 @@ jobs:
           fi
           curl -f -L -A "Mozilla/5.0" -e "https://pixeldrain.com/" -o input_video.mp4 "$URL"
 
+      - name: Inject OnlyKsub credit card (start + end)
+        run: |
+          set -e
+          DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 input_video.mp4)
+          python3 scripts/inject_credits.py subs.ass "$DURATION" "Noto Sans Sinhala"
+
       - name: Detect and remove black bars
         run: |
           set -e

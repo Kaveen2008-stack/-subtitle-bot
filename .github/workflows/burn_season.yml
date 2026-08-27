@@ -23,6 +23,10 @@ on:
         description: "TMDB show ID"
         required: true
         type: string
+      drama_name:
+        description: "Drama/show name (used to build output filenames)"
+        required: true
+        type: string
       season_number:
         description: "Season number"
         required: true
@@ -346,6 +350,16 @@ jobs:
         with:
           name: subs-ep${{ matrix.episode.episode_number }}
 
+      - name: Build sanitized output name (drama_S<season>E<episode>_<quality>)
+        id: name
+        run: |
+          set -e
+          RAW="${{ inputs.drama_name }}_S${{ inputs.season_number }}E${{ matrix.episode.episode_number }}"
+          SAFE=$(echo "$RAW" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+          OUT_NAME="${SAFE}_${{ matrix.quality }}.mp4"
+          echo "OUT_NAME=${OUT_NAME}" >> "$GITHUB_ENV"
+          echo "Output filename will be: ${OUT_NAME}"
+
       - name: Fetch render settings for ${{ matrix.quality }}
         run: |
           set -e
@@ -397,7 +411,7 @@ jobs:
           ffmpeg -y -i input_video.mp4 -vf "$FILTER" \
             -c:v libx264 -preset veryfast -crf "${RENDER_CRF}" -pix_fmt yuv420p \
             -c:a aac -b:a "${RENDER_AUDIO_BITRATE}" -movflags +faststart \
-            "output.mp4"
+            "$OUT_NAME"
 
       - name: Upload to Pixeldrain
         id: pixeldrain
@@ -405,7 +419,7 @@ jobs:
           PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
         run: |
           set -e
-          python scripts/upload_pixeldrain.py output.mp4
+          python scripts/upload_pixeldrain.py "$OUT_NAME"
           echo "link=$(cat pixeldrain_link.txt)" >> "$GITHUB_OUTPUT"
 
       - name: Save 1080p video for later sequential Telegram upload
@@ -419,7 +433,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: telegram-pending-ep${{ matrix.episode.episode_number }}
-          path: output.mp4
+          path: ${{ env.OUT_NAME }}
           retention-days: 1
 
       - name: Upload to VOE.sx (1080p only)
@@ -555,8 +569,16 @@ jobs:
               echo "No artifact found for episode $EP (burn may have failed) - skipping."
               continue
             fi
-            CAPTION="S${{ inputs.season_number }}E${EP} (1080p) - OnlyKsub"
-            if python scripts/upload_telegram_local.py "dl/output.mp4" "$CAPTION"; then
+            # The artifact contains exactly one properly-named video file
+            # (drama_S<season>E<episode>_<quality>.mp4) - find it instead of
+            # assuming a hardcoded filename.
+            VIDEO_FILE=$(find dl -maxdepth 1 -type f -iname "*.mp4" | head -1)
+            if [ -z "$VIDEO_FILE" ]; then
+              echo "WARNING: no video file found in artifact for episode $EP - skipping."
+              continue
+            fi
+            CAPTION="${{ inputs.drama_name }} S${{ inputs.season_number }}E${EP} (1080p) - OnlyKsub"
+            if python scripts/upload_telegram_local.py "$VIDEO_FILE" "$CAPTION"; then
               echo "Episode $EP uploaded: $(cat telegram_link.txt)"
             else
               echo "WARNING: Episode $EP Telegram upload failed."

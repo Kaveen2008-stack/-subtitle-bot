@@ -608,7 +608,7 @@ jobs:
               echo "WARNING: no video file found in artifact for episode $EP - skipping."
               continue
             fi
-            CAPTION="${{ inputs.drama_name }} S${{ inputs.season_number }}E${EP} (1080p) - OnlyKsub"
+            CAPTION="${{ inputs.drama_name }} S${{ inputs.season_number }}E${EP} (${{ needs.extract-and-plan.outputs.telegram_quality }}) - OnlyKsub"
             if python scripts/upload_telegram_local.py "$VIDEO_FILE" "$CAPTION"; then
               echo "Episode $EP uploaded: $(cat telegram_link.txt)"
             else

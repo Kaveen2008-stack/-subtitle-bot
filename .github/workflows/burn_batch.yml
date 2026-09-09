@@ -516,6 +516,10 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           EPISODES_JSON: ${{ needs.plan.outputs.episodes }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          TMDB_ID: ${{ inputs.tmdb_id }}
+          SEASON_NUMBER: ${{ inputs.season_number }}
+          TELEGRAM_QUALITY: ${{ needs.plan.outputs.telegram_quality }}
         run: |
           set +e  # one episode's failure shouldn't stop the rest
           echo "$EPISODES_JSON" > episodes.json
@@ -537,11 +541,29 @@ jobs:
               echo "WARNING: no video file found in artifact for episode $EP - skipping."
               continue
             fi
+            rm -f telegram_message_id.txt telegram_chat_id.txt
             CAPTION="${{ inputs.drama_name }} S${{ inputs.season_number }}E${EP} - OnlyKsub"
             if python scripts/upload_telegram_local.py "$VIDEO_FILE" "$CAPTION"; then
               echo "Episode $EP uploaded: $(cat telegram_link.txt)"
+              if [ -f telegram_message_id.txt ]; then
+                MSG_ID=$(cat telegram_message_id.txt)
+                CHAT_ID=$(cat telegram_chat_id.txt)
+                curl -s -f -X POST "https://onlyksub.vercel.app/api/webhook-telegram-uploaded" \
+                  -H "Content-Type: application/json" \
+                  -H "x-webhook-secret: ${WEBHOOK_SECRET}" \
+                  -d "{
+                    \"tmdb_id\": ${TMDB_ID},
+                    \"season_number\": ${SEASON_NUMBER},
+                    \"episode_number\": ${EP},
+                    \"quality\": \"${TELEGRAM_QUALITY}\",
+                    \"telegram_chat_id\": \"${CHAT_ID}\",
+                    \"telegram_message_id\": ${MSG_ID}
+                  }" \
+                  && echo "Notified website for episode $EP (chat_id=${CHAT_ID}, message_id=${MSG_ID})." \
+                  || echo "::warning::Failed to notify website about episode $EP's Telegram upload."
+              fi
             else
-              echo "WARNING: Episode $EP Telegram upload failed."
+              echo "::warning::Episode $EP Telegram upload failed - the site will NOT show a Telegram download link for this episode."
             fi
             echo "Waiting 15s before next upload (flood control safety margin)..."
             sleep 15

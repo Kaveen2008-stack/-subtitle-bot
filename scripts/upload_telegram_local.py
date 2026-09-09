@@ -88,7 +88,14 @@ def main():
             link = build_message_link(channel_id, message_id)
             with open("telegram_link.txt", "w") as f:
                 f.write(link)
-            print(f"Uploaded successfully: {link}")
+            # Machine-readable files so the workflow can report this back
+            # to the website (webhook-telegram-uploaded) without having to
+            # re-parse telegram_link.txt's human-readable format.
+            with open("telegram_message_id.txt", "w") as f:
+                f.write(str(message_id))
+            with open("telegram_chat_id.txt", "w") as f:
+                f.write(str(channel_id))
+            print(f"Uploaded successfully: {link} (message_id={message_id})")
             return
 
         # Telegram flood control (429) - honor the retry_after it tells us

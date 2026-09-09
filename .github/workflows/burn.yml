@@ -382,8 +382,34 @@ jobs:
           if python scripts/upload_telegram_local.py "$OUT_NAME" "$CAPTION"; then
             echo "Uploaded $OUT_NAME to Telegram via local Bot API server."
           else
-            echo "WARNING: Telegram upload failed, continuing without it."
+            echo "::warning::Telegram upload failed for ${{ matrix.quality }} - the site will NOT show a Telegram download link for this episode."
           fi
+
+      - name: Notify website about Telegram upload (so the DB gets telegram_chat_id/message_id)
+        if: matrix.quality == needs.prepare-subs.outputs.telegram_quality
+        continue-on-error: true
+        env:
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        run: |
+          if [ ! -f telegram_message_id.txt ]; then
+            echo "No telegram_message_id.txt (upload failed or was skipped) - not calling webhook-telegram-uploaded."
+            exit 0
+          fi
+          MSG_ID=$(cat telegram_message_id.txt)
+          CHAT_ID=$(cat telegram_chat_id.txt)
+          curl -s -f -X POST "https://onlyksub.vercel.app/api/webhook-telegram-uploaded" \
+            -H "Content-Type: application/json" \
+            -H "x-webhook-secret: ${WEBHOOK_SECRET}" \
+            -d "{
+              \"tmdb_id\": ${{ inputs.tmdb_id }},
+              \"season_number\": ${{ inputs.season_number }},
+              \"episode_number\": ${{ inputs.episode_number }},
+              \"quality\": \"${{ matrix.quality }}\",
+              \"telegram_chat_id\": \"${CHAT_ID}\",
+              \"telegram_message_id\": ${MSG_ID}
+            }" \
+            && echo "Notified website of Telegram upload (chat_id=${CHAT_ID}, message_id=${MSG_ID})." \
+            || echo "::warning::Failed to notify website about Telegram upload (webhook-telegram-uploaded call failed)."
 
       - name: Upload to VOE.sx (1080p only)
         id: voe

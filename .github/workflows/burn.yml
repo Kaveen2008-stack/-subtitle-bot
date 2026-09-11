@@ -205,17 +205,6 @@ jobs:
     needs: prepare-subs
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    # Local Telegram Bot API server - lets us upload up to 2GB per video
-    # using the SAME bot token, instead of the normal 50MB limit that
-    # applies when talking to api.telegram.org directly.
-    services:
-      telegram-bot-api:
-        image: aiogram/telegram-bot-api:latest
-        env:
-          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-        ports:
-          - 8081:8081
     strategy:
       fail-fast: false   # one quality failing shouldn't cancel the others
       matrix:
@@ -359,57 +348,19 @@ jobs:
             exit 1
           fi
 
-      - name: Wait for local Telegram Bot API server
-        run: |
-          for i in $(seq 1 30); do
-            if curl -s -o /dev/null "http://localhost:8081"; then
-              echo "Local Bot API server is up."
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "WARNING: local Bot API server did not come up in time, Telegram upload will likely fail."
-
-      - name: Upload to Telegram (local Bot API, up to 2GB, 1080p only to reduce flood risk)
-        id: telegram
-        if: matrix.quality == needs.prepare-subs.outputs.telegram_quality
-        continue-on-error: true
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
-        run: |
-          CAPTION="${{ needs.prepare-subs.outputs.safe_name }} (${{ matrix.quality }}) - OnlyKsub"
-          if python scripts/upload_telegram_local.py "$OUT_NAME" "$CAPTION"; then
-            echo "Uploaded $OUT_NAME to Telegram via local Bot API server."
-          else
-            echo "::warning::Telegram upload failed for ${{ matrix.quality }} - the site will NOT show a Telegram download link for this episode."
-          fi
-
-      - name: Notify website about Telegram upload (so the DB gets telegram_chat_id/message_id)
-        if: matrix.quality == needs.prepare-subs.outputs.telegram_quality
-        continue-on-error: true
-        env:
-          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
-        run: |
-          if [ ! -f telegram_message_id.txt ]; then
-            echo "No telegram_message_id.txt (upload failed or was skipped) - not calling webhook-telegram-uploaded."
-            exit 0
-          fi
-          MSG_ID=$(cat telegram_message_id.txt)
-          CHAT_ID=$(cat telegram_chat_id.txt)
-          curl -s -f -X POST "https://onlyksub.vercel.app/api/webhook-telegram-uploaded" \
-            -H "Content-Type: application/json" \
-            -H "x-webhook-secret: ${WEBHOOK_SECRET}" \
-            -d "{
-              \"tmdb_id\": ${{ inputs.tmdb_id }},
-              \"season_number\": ${{ inputs.season_number }},
-              \"episode_number\": ${{ inputs.episode_number }},
-              \"quality\": \"${{ matrix.quality }}\",
-              \"telegram_chat_id\": \"${CHAT_ID}\",
-              \"telegram_message_id\": ${MSG_ID}
-            }" \
-            && echo "Notified website of Telegram upload (chat_id=${CHAT_ID}, message_id=${MSG_ID})." \
-            || echo "::warning::Failed to notify website about Telegram upload (webhook-telegram-uploaded call failed)."
+      - name: Save video for later sequential Telegram upload
+        # Telegram upload is done OUTSIDE this concurrent matrix job (see
+        # the separate upload-telegram job below), same pattern as
+        # burn_batch.yml uses. Uploading from parallel matrix runners (one
+        # per quality) on the SAME bot token at once risks Telegram's
+        # flood control (retry_after can be very large since it looks
+        # like abuse from Telegram's side). Sequential, one-at-a-time
+        # uploads after all qualities finish rendering avoids that.
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-pending-${{ matrix.quality }}
+          path: ${{ env.OUT_NAME }}
+          retention-days: 1
 
       - name: Upload to VOE.sx (1080p only)
         id: voe
@@ -496,11 +447,99 @@ jobs:
           retention-days: 3
 
   # ============================================================
-  # JOB 3: Runs once ALL 3 quality jobs finish (success or fail).
+  # JOB 3: Uploads each quality to Telegram ONE AT A TIME, after all
+  # burns finish - avoids flood control from 3 parallel matrix
+  # runners hitting the same bot token/channel at once (same pattern
+  # as burn_batch.yml's upload-telegram job).
+  # ============================================================
+  upload-telegram:
+    needs: [prepare-subs, burn]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      telegram-bot-api:
+        image: aiogram/telegram-bot-api:latest
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        ports:
+          - 8081:8081
+    steps:
+      - name: Checkout repo (for scripts)
+        uses: actions/checkout@v4
+
+      - name: Set up Python deps
+        run: pip install --quiet requests
+
+      - name: Wait for local Telegram Bot API server
+        run: |
+          for i in $(seq 1 30); do
+            if curl -s -o /dev/null "http://localhost:8081"; then
+              echo "Local Bot API server is up."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "WARNING: local Bot API server did not come up in time."
+
+      - name: Upload each quality sequentially
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          QUALITIES_JSON: ${{ inputs.qualities_json }}
+        run: |
+          set +e  # one quality's failure shouldn't stop the rest
+          QUALITIES=$(python3 -c "import json,os; print(' '.join(json.loads(os.environ['QUALITIES_JSON'])))")
+          for QUALITY in $QUALITIES; do
+            echo "=== Quality $QUALITY ==="
+            ARTIFACT_NAME="telegram-pending-${QUALITY}"
+            rm -rf dl && mkdir dl
+            if ! gh run download "${{ github.run_id }}" --name "$ARTIFACT_NAME" --dir dl 2>/dev/null; then
+              echo "No artifact found for $QUALITY (burn may have failed) - skipping."
+              continue
+            fi
+            VIDEO_FILE=$(find dl -maxdepth 1 -type f -iname "*.mp4" | head -1)
+            if [ -z "$VIDEO_FILE" ]; then
+              echo "WARNING: no video file found in artifact for $QUALITY - skipping."
+              continue
+            fi
+            rm -f telegram_message_id.txt telegram_chat_id.txt
+            CAPTION="${{ needs.prepare-subs.outputs.safe_name }} (${QUALITY}) - OnlyKsub"
+            if python scripts/upload_telegram_local.py "$VIDEO_FILE" "$CAPTION"; then
+              echo "$QUALITY uploaded: $(cat telegram_link.txt)"
+              if [ -f telegram_message_id.txt ]; then
+                MSG_ID=$(cat telegram_message_id.txt)
+                CHAT_ID=$(cat telegram_chat_id.txt)
+                curl -s -f -X POST "https://onlyksub.vercel.app/api/webhook-telegram-uploaded" \
+                  -H "Content-Type: application/json" \
+                  -H "x-webhook-secret: ${WEBHOOK_SECRET}" \
+                  -d "{
+                    \"tmdb_id\": ${{ inputs.tmdb_id }},
+                    \"season_number\": ${{ inputs.season_number }},
+                    \"episode_number\": ${{ inputs.episode_number }},
+                    \"quality\": \"${QUALITY}\",
+                    \"telegram_chat_id\": \"${CHAT_ID}\",
+                    \"telegram_message_id\": ${MSG_ID}
+                  }" \
+                  && echo "Notified website for $QUALITY (chat_id=${CHAT_ID}, message_id=${MSG_ID})." \
+                  || echo "::warning::Failed to notify website about $QUALITY's Telegram upload."
+              fi
+            else
+              echo "::warning::$QUALITY Telegram upload failed - the site will NOT show a Telegram download link for this quality."
+            fi
+            echo "Waiting 15s before next upload (flood control safety margin)..."
+            sleep 15
+          done
+
+  # ============================================================
+  # JOB 4: Runs once ALL 3 quality jobs + Telegram uploads finish.
   # Marks the Supabase job row as done.
   # ============================================================
   finalize:
-    needs: burn
+    needs: [burn, upload-telegram]
     if: always()
     runs-on: ubuntu-latest
     steps:

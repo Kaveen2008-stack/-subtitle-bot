@@ -24,7 +24,17 @@ TARGET_CALLS = 3          # aim for this many API calls per episode - batch size
                            # tested-safe range; 350+ caused missing blocks in testing)
 MIN_BATCH_SIZE = 60
 MAX_BATCH_SIZE = 300
-MODEL_NAME = "gemini-3.5-flash"
+# FIX: "gemini-3.5-flash" is NOT a real Gemini model id - every API call
+# failed with a 404, all keys rotated out, and main() then silently wrote
+# the ORIGINAL ENGLISH text to the output file. Episodes marked "sinhala"
+# were being burned with English subs. These are the real ids, tried in
+# order until one of them actually works on the current key.
+MODEL_CANDIDATES = [
+    "gemini-2.0-flash",
+    "gemini-2.5-flash",
+    "gemini-1.5-flash",
+]
+MODEL_NAME = MODEL_CANDIDATES[0]
 MAX_RETRIES_PER_KEY = 2   # retries on the SAME key before rotating to the next one
 COOLDOWN_SECONDS = 3      # brief pause between retries
 
@@ -167,6 +177,29 @@ class KeyRotator:
         self._genai.configure(api_key=self.api_keys[self.current_idx])
         self.model = self._genai.GenerativeModel(self.model_name)
 
+    def resolve_working_model(self, candidates):
+        """Probe the candidate model ids with a 1-token request and keep the
+        first one that actually responds. Without this, a wrong/retired
+        model id silently degrades into 'no translation at all' (the bug
+        this replaces). Fails LOUDLY if none work, so the workflow stops
+        instead of burning English subs labelled as Sinhala."""
+        last_err = None
+        for name in candidates:
+            try:
+                probe = self._genai.GenerativeModel(name)
+                probe.generate_content("ping", request_options={"timeout": 60})
+                self.model_name = name
+                self.model = probe
+                print(f"Using Gemini model: {name}", file=sys.stderr)
+                return name
+            except Exception as e:
+                last_err = e
+                print(f"  Model '{name}' unavailable ({e}), trying next...", file=sys.stderr)
+        raise RuntimeError(
+            f"None of the Gemini models {candidates} are usable with the provided "
+            f"API key(s). Last error: {last_err}"
+        )
+
     def rotate(self):
         self.current_idx = (self.current_idx + 1) % len(self.api_keys)
         print(f"  Rotating to API key #{self.current_idx + 1}/{len(self.api_keys)}",
@@ -232,6 +265,7 @@ def main():
 
     api_keys = load_api_keys()
     rotator = KeyRotator(api_keys, MODEL_NAME)
+    rotator.resolve_working_model(MODEL_CANDIDATES)
 
     all_blocks = parse_srt_blocks(input_path)
     if not all_blocks:
@@ -249,6 +283,7 @@ def main():
           f"Actual calls needed: {-(-len(all_blocks) // batch_size)}", file=sys.stderr)
 
     translated_by_index = {}
+    total_untranslated = 0
 
     for start in range(0, len(all_blocks), batch_size):
         chunk = all_blocks[start:start + batch_size]
@@ -269,10 +304,15 @@ def main():
 
         matched = sum(1 for idx in expected_indexes if idx in result_by_idx)
         if matched < len(expected_indexes):
+            # FIX: this used to loop over the WHOLE chunk and reset every
+            # block back to the original English - so one missing block out
+            # of 300 threw away 299 perfectly good translations. The
+            # per-block fallback above already keeps the original text for
+            # exactly the blocks that are missing, and nothing else.
             print(f"  WARNING: {len(expected_indexes) - matched} block(s) in this chunk "
-                  f"kept original text (untranslated).", file=sys.stderr)
-            for idx, original_block in zip(expected_indexes, chunk):
-                translated_by_index[idx] = original_block
+                  f"kept original text (untranslated); the other "
+                  f"{matched} translated block(s) are preserved.", file=sys.stderr)
+        total_untranslated += len(expected_indexes) - matched
 
     # Write out in original order
     with open(output_path, "w", encoding="utf-8") as f:
@@ -281,7 +321,20 @@ def main():
             final_block = translated_by_index.get(idx, block)
             f.write(final_block + "\n\n")
 
-    print(f"Translated {len(all_blocks)} blocks -> {output_path}")
+    translated_count = len(all_blocks) - total_untranslated
+    print(f"Translated {translated_count}/{len(all_blocks)} blocks -> {output_path}")
+
+    # Hard guard: if NOTHING (or almost nothing) came back translated, the
+    # output is just the English input renamed. Burning that as "Sinhala"
+    # wastes ~90 min of runner time and produces an unusable episode, so
+    # fail the step instead and let the workflow report it.
+    if len(all_blocks) and translated_count / len(all_blocks) < 0.5:
+        print(
+            f"ERROR: only {translated_count}/{len(all_blocks)} blocks were actually "
+            f"translated - refusing to emit a mostly-English file as Sinhala subtitles.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":

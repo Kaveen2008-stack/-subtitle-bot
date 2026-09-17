@@ -205,19 +205,6 @@ jobs:
     needs: prepare-subs
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    # Local Telegram Bot API server - lets us upload up to 2GB per video
-    # using the SAME bot token, instead of the normal 50MB limit. Only
-    # needed for the 1080p job (see the Telegram upload step below), but
-    # declaring it here (not per-matrix-value) is the only way GitHub
-    # Actions supports service containers.
-    services:
-      telegram-bot-api:
-        image: aiogram/telegram-bot-api:latest
-        env:
-          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-        ports:
-          - 8081:8081
     strategy:
       fail-fast: false   # one quality failing shouldn't cancel the others
       matrix:
@@ -369,50 +356,74 @@ jobs:
         # flood control (retry_after can be very large since it looks
         # like abuse from Telegram's side). Sequential, one-at-a-time
         # uploads after all qualities finish rendering avoids that.
-        # (Superseded remote commit 58a721b's inline 1080p-only Telegram
-        # step during this merge - job 3 "upload-telegram" below already
-        # covers every selected quality, sequentially, and already
-        # notifies the website via webhook-telegram-uploaded.)
         uses: actions/upload-artifact@v4
         with:
           name: telegram-pending-${{ matrix.quality }}
           path: ${{ env.OUT_NAME }}
           retention-days: 1
 
-      - name: Upload to VOE.sx (1080p only)
+      - name: Upload to VOE.sx (1080p only, direct file upload)
         id: voe
         if: matrix.quality == needs.prepare-subs.outputs.telegram_quality
         continue-on-error: true
         env:
           VOE_API_KEY: ${{ secrets.VOE_API_KEY }}
-          PIXELDRAIN_LINK: ${{ steps.pixeldrain.outputs.link }}
         run: |
           ./scripts/report_status.sh "upload_voe" "started"
-          RESPONSE=$(curl -s "https://voe.sx/api/upload/url?key=${VOE_API_KEY}&url=${PIXELDRAIN_LINK}")
-          echo "VOE upload response: $RESPONSE"
-          QUEUE_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',{}).get('queueID',''))" 2>/dev/null || echo "")
 
-          if [ -z "$QUEUE_ID" ]; then
-            echo "WARNING: VOE upload could not be queued (bad response), continuing without VOE link."
-            ./scripts/report_status.sh "upload_voe" "failed" "{\"reason\":\"no queueID in response\"}"
+          # Was: ask VOE to fetch the file itself from a Pixeldrain URL
+          # (upload/url). Pixeldrain blocks/CAPTCHA-walls fetches coming
+          # from VOE's servers (datacenter IP), so VOE downloaded a CAPTCHA
+          # or error page instead of the video ("Not a video file") no
+          # matter which Pixeldrain URL shape was used. Fix: skip the
+          # remote-fetch step entirely and POST the video file we already
+          # have on this runner straight to VOE.
+
+          SERVER_RESPONSE=$(curl -s "https://voe.sx/api/upload/server?key=${VOE_API_KEY}")
+          echo "VOE upload/server response: $SERVER_RESPONSE"
+          UPLOAD_SERVER=$(echo "$SERVER_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',{}).get('upload_server',''))" 2>/dev/null || echo "")
+
+          if [ -z "$UPLOAD_SERVER" ]; then
+            echo "WARNING: could not get a VOE upload server, continuing without VOE link."
+            ./scripts/report_status.sh "upload_voe" "failed" "{\"reason\":\"no upload_server in response\"}"
             exit 0
           fi
+          echo "VOE upload server: $UPLOAD_SERVER"
 
-          for i in $(seq 1 90); do
-            sleep 10
-            STATUS=$(curl -s "https://voe.sx/api/upload/url/list?key=${VOE_API_KEY}&id=${QUEUE_ID}")
-            PERCENT=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['list']['data'][0].get('percent', 0))" 2>/dev/null || echo "0")
-            FILE_CODE=$(echo "$STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['list']['data'][0].get('file_code', ''))" 2>/dev/null || echo "")
-            echo "Attempt $i: percent=$PERCENT"
-            if [ "$PERCENT" = "100" ] && [ -n "$FILE_CODE" ]; then
-              echo "link=https://voe.sx/e/${FILE_CODE}" >> "$GITHUB_OUTPUT"
-              echo "VOE embed link ready: https://voe.sx/e/${FILE_CODE}"
-              ./scripts/report_status.sh "upload_voe" "success" "{\"link\":\"https://voe.sx/e/${FILE_CODE}\"}"
-              exit 0
-            fi
-          done
-          echo "WARNING: VOE processing timed out, continuing without VOE link."
-          ./scripts/report_status.sh "upload_voe" "failed" '{"reason":"timed out"}'
+          UPLOAD_RESPONSE=$(curl -s -F "key=${VOE_API_KEY}" -F "file=@${OUT_NAME}" "$UPLOAD_SERVER")
+          echo "VOE direct upload response: $UPLOAD_RESPONSE"
+
+          # Response shape for the direct-upload endpoint isn't fully
+          # documented publicly, so try every plausible path this family
+          # of file-host APIs (VOE/StreamHG/Doodstream-style clones) uses,
+          # instead of assuming one and breaking silently if it's wrong.
+          FILE_CODE=$(echo "$UPLOAD_RESPONSE" | python3 -c "
+          import sys, json
+          try:
+              d = json.load(sys.stdin)
+          except Exception:
+              print('')
+              raise SystemExit
+          code = ''
+          if isinstance(d, dict):
+              if isinstance(d.get('files'), list) and d['files']:
+                  f0 = d['files'][0]
+                  code = f0.get('file_code') or f0.get('filecode') or ''
+              if not code:
+                  code = d.get('file_code') or d.get('filecode') or ''
+              if not code and isinstance(d.get('result'), dict):
+                  code = d['result'].get('file_code') or d['result'].get('filecode') or ''
+          print(code)
+          " 2>/dev/null || echo "")
+
+          if [ -n "$FILE_CODE" ]; then
+            echo "link=https://voe.sx/e/${FILE_CODE}" >> "$GITHUB_OUTPUT"
+            echo "VOE embed link ready: https://voe.sx/e/${FILE_CODE}"
+            ./scripts/report_status.sh "upload_voe" "success" "{\"link\":\"https://voe.sx/e/${FILE_CODE}\"}"
+          else
+            echo "WARNING: VOE direct upload response had no recognizable file_code - see the raw response logged above, continuing without VOE link."
+            ./scripts/report_status.sh "upload_voe" "failed" '{"reason":"no file_code in direct-upload response"}'
+          fi
 
       - name: Notify website (webhook) for ${{ matrix.quality }}
         if: always()
@@ -576,3 +587,4 @@ jobs:
               -d "{\"status\":\"${FINAL_STATUS}\",\"finished_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"github_run_url\":\"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"}" \
               || true
           fi
+

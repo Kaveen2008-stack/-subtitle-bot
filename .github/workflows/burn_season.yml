@@ -41,6 +41,14 @@ on:
         required: false
         type: string
         default: "srt"
+      job_id:
+        description: "Supabase job UUID (for dashboard tracking)"
+        required: false
+        type: string
+      telegram_message_id:
+        description: "Telegram message ID to edit for live progress"
+        required: false
+        type: string
 
 concurrency:
   group: burn-season-${{ inputs.chat_id }}-${{ inputs.tmdb_id }}-${{ inputs.season_number }}
@@ -233,6 +241,10 @@ jobs:
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      JOB_ID: ${{ inputs.job_id }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ inputs.chat_id }}
+      TELEGRAM_MESSAGE_ID: ${{ inputs.telegram_message_id }}
     steps:
       - name: Checkout repo (for scripts)
         uses: actions/checkout@v4
@@ -350,6 +362,8 @@ jobs:
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ inputs.chat_id }}
+      TELEGRAM_MESSAGE_ID: ${{ inputs.telegram_message_id }}
+      JOB_ID: ${{ inputs.job_id }}
     steps:
       - name: Checkout repo (for scripts)
         uses: actions/checkout@v4
@@ -462,6 +476,11 @@ jobs:
         # after all burns finish avoids that entirely. All qualities now
         # upload (previously 1080p-only), so the artifact is keyed by
         # episode AND quality.
+        # (Superseded remote commit 58a721b's inline per-quality Telegram
+        # step during this merge - job "upload-telegram" below already
+        # covers every episode x quality, sequentially, with the same
+        # webhook-telegram-uploaded notification. Its inline version also
+        # referenced a hardcoded output.mp4 instead of $OUT_NAME.)
         uses: actions/upload-artifact@v4
         with:
           name: telegram-pending-ep${{ matrix.episode.episode_number }}-${{ matrix.quality }}
@@ -663,3 +682,24 @@ jobs:
           fi
           curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             -d chat_id="${CHAT_ID}" --data-urlencode text="$STATUS"
+
+      # Without this, the Supabase `jobs` row created by the web dashboard
+      # (or the bot) stayed "queued" FOREVER - every season burn looked
+      # permanently pending on the Jobs page even after it finished fine.
+      - name: Mark job done in dashboard
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          if [ -n "$SUPABASE_URL" ] && [ -n "$JOB_ID" ]; then
+            FINAL_STATUS="done"
+            if [ "${{ needs.burn.result }}" != "success" ]; then FINAL_STATUS="failed"; fi
+            curl -s -o /dev/null -X PATCH "${SUPABASE_URL}/rest/v1/jobs?id=eq.${JOB_ID}" \
+              -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+              -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+              -H "Content-Type: application/json" \
+              -d "{\"status\":\"${FINAL_STATUS}\",\"finished_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"github_run_url\":\"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"}" \
+              || true
+          fi

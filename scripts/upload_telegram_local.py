@@ -1,37 +1,37 @@
 """
 Uploads a video to a Telegram channel via a LOCAL Telegram Bot API server
-(not api.telegram.org directly) - this raises the upload limit from the
-normal Bot API's 50MB to 2000MB (2GB), using the SAME bot token you
-already have. No phone-number login or session string needed - the local
-server only needs your api_id + api_hash (from my.telegram.org) to run.
+(not api.telegram.org directly) - raises the upload limit from the normal
+Bot API's 50MB to 2000MB (2GB), using the SAME bot token. No phone-number
+login or session string needed.
 
 Usage: python upload_telegram_local.py <file_path> <caption>
 
 Required env vars:
-  TELEGRAM_BOT_TOKEN     - your existing bot token (same one used elsewhere)
-  TELEGRAM_CHANNEL_ID    - channel to post to. Either:
-                             - a public channel username, e.g. "@mychannel"
-                             - a numeric chat id, e.g. "-1001234567890"
+  TELEGRAM_BOT_TOKEN     - your existing bot token
+  TELEGRAM_CHANNEL_ID    - channel to post to (numeric id or @username)
 Optional:
-  LOCAL_BOT_API_BASE     - defaults to http://localhost:8081 (where the
-                            telegram-bot-api service container listens,
-                            see the workflow's `services:` block)
+  LOCAL_BOT_API_BASE     - defaults to http://localhost:8081
+
+On success, writes the result in two forms so either consumer can read it:
+  - telegram_link.txt / telegram_message_id.txt / telegram_chat_id.txt
+    (plain text, one value per file)
+  - telegram_upload_result.json {chat_id, message_id, link}
+    (read by report_telegram_upload.py to tell the website which message
+    holds this episode's video)
 """
 import os
 import sys
 import time
+import json
 import requests
 
 
 def build_message_link(channel_id: str, message_id: int) -> str:
-    # Public channel (@username) -> https://t.me/username/123
     if channel_id.startswith("@"):
         return f"https://t.me/{channel_id[1:]}/{message_id}"
-    # Private channel numeric id (-100xxxxxxxxxx) -> https://t.me/c/xxxxxxxxxx/123
     if channel_id.startswith("-100"):
         internal_id = channel_id[4:]
         return f"https://t.me/c/{internal_id}/{message_id}"
-    # Fallback: just return the raw id/message combo for debugging
     return f"chat={channel_id} message_id={message_id}"
 
 
@@ -48,6 +48,17 @@ def upload_once(url, channel_id, caption, file_path):
             timeout=3600,
         )
     return resp
+
+
+def write_result(channel_id, message_id, link):
+    with open("telegram_link.txt", "w") as f:
+        f.write(link)
+    with open("telegram_message_id.txt", "w") as f:
+        f.write(str(message_id))
+    with open("telegram_chat_id.txt", "w") as f:
+        f.write(str(channel_id))
+    with open("telegram_upload_result.json", "w") as f:
+        json.dump({"chat_id": str(channel_id), "message_id": message_id, "link": link}, f)
 
 
 def main():
@@ -85,17 +96,13 @@ def main():
 
         if data.get("ok"):
             message_id = data["result"]["message_id"]
+            # Prefer the chat id Telegram actually confirmed the message
+            # landed in over the channel_id we were given (e.g. an
+            # @username input still resolves to a numeric chat id here).
+            chat_id = str(data["result"].get("chat", {}).get("id", channel_id))
             link = build_message_link(channel_id, message_id)
-            with open("telegram_link.txt", "w") as f:
-                f.write(link)
-            # Machine-readable files so the workflow can report this back
-            # to the website (webhook-telegram-uploaded) without having to
-            # re-parse telegram_link.txt's human-readable format.
-            with open("telegram_message_id.txt", "w") as f:
-                f.write(str(message_id))
-            with open("telegram_chat_id.txt", "w") as f:
-                f.write(str(channel_id))
-            print(f"Uploaded successfully: {link} (message_id={message_id})")
+            write_result(chat_id, message_id, link)
+            print(f"Uploaded successfully: {link} (chat_id={chat_id}, message_id={message_id})")
             return
 
         # Telegram flood control (429) - honor the retry_after it tells us

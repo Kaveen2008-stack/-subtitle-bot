@@ -205,6 +205,19 @@ jobs:
     needs: prepare-subs
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # Local Telegram Bot API server - lets us upload up to 2GB per video
+    # using the SAME bot token, instead of the normal 50MB limit. Only
+    # needed for the 1080p job (see the Telegram upload step below), but
+    # declaring it here (not per-matrix-value) is the only way GitHub
+    # Actions supports service containers.
+    services:
+      telegram-bot-api:
+        image: aiogram/telegram-bot-api:latest
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        ports:
+          - 8081:8081
     strategy:
       fail-fast: false   # one quality failing shouldn't cancel the others
       matrix:
@@ -356,6 +369,10 @@ jobs:
         # flood control (retry_after can be very large since it looks
         # like abuse from Telegram's side). Sequential, one-at-a-time
         # uploads after all qualities finish rendering avoids that.
+        # (Superseded remote commit 58a721b's inline 1080p-only Telegram
+        # step during this merge - job 3 "upload-telegram" below already
+        # covers every selected quality, sequentially, and already
+        # notifies the website via webhook-telegram-uploaded.)
         uses: actions/upload-artifact@v4
         with:
           name: telegram-pending-${{ matrix.quality }}

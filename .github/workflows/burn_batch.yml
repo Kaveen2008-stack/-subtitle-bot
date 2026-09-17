@@ -386,6 +386,10 @@ jobs:
         # Sequential, one-at-a-time uploads after all burns finish avoids
         # that entirely. All qualities now upload (previously 1080p-only),
         # so the artifact is keyed by episode AND quality.
+        # (Superseded remote commit 58a721b's inline per-quality Telegram
+        # step during this merge - job "upload-telegram" below already
+        # covers every episode x quality, sequentially, with the same
+        # webhook-telegram-uploaded notification.)
         uses: actions/upload-artifact@v4
         with:
           name: telegram-pending-ep${{ matrix.episode.episode_number }}-${{ matrix.quality }}

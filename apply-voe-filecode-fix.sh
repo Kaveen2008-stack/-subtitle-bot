@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -e
-echo "🔧 Fixing VOE upload_server extraction (result is a URL string, not a dict)..."
+echo "🔧 Fixing VOE file_code extraction (nested under \"file\" object)..."
 
 # Run this from the ROOT of your subtitle-bot repo:
-#   bash apply-voe-upload-server-fix.sh
+#   bash apply-voe-filecode-fix.sh
 
 mkdir -p .github/workflows
 
-cat > '.github/workflows/burn.yml' << 'VOEFIX2_EOF'
+cat > '.github/workflows/burn.yml' << 'VOEFIX3_EOF'
 name: Burn Subtitles (Matrix Parallel - 3 Qualities)
 
 on:
@@ -429,7 +429,10 @@ jobs:
               raise SystemExit
           code = ''
           if isinstance(d, dict):
-              if isinstance(d.get('files'), list) and d['files']:
+              # Confirmed real shape: a singular {\"file\": {\"file_code\": ...}}
+              if isinstance(d.get('file'), dict):
+                  code = d['file'].get('file_code') or d['file'].get('filecode') or ''
+              if not code and isinstance(d.get('files'), list) and d['files']:
                   f0 = d['files'][0]
                   code = f0.get('file_code') or f0.get('filecode') or ''
               if not code:
@@ -611,10 +614,10 @@ jobs:
               || true
           fi
 
-VOEFIX2_EOF
+VOEFIX3_EOF
 echo '  ✓ wrote .github/workflows/burn.yml'
 
-cat > '.github/workflows/burn_batch.yml' << 'VOEFIX2_EOF'
+cat > '.github/workflows/burn_batch.yml' << 'VOEFIX3_EOF'
 name: Burn Subtitles Batch (Per-Episode List - Matrix Parallel)
 
 on:
@@ -1063,7 +1066,10 @@ jobs:
               raise SystemExit
           code = ''
           if isinstance(d, dict):
-              if isinstance(d.get('files'), list) and d['files']:
+              # Confirmed real shape: a singular {\"file\": {\"file_code\": ...}}
+              if isinstance(d.get('file'), dict):
+                  code = d['file'].get('file_code') or d['file'].get('filecode') or ''
+              if not code and isinstance(d.get('files'), list) and d['files']:
                   f0 = d['files'][0]
                   code = f0.get('file_code') or f0.get('filecode') or ''
               if not code:
@@ -1256,10 +1262,10 @@ jobs:
               || true
           fi
 
-VOEFIX2_EOF
+VOEFIX3_EOF
 echo '  ✓ wrote .github/workflows/burn_batch.yml'
 
-cat > '.github/workflows/burn_season.yml' << 'VOEFIX2_EOF'
+cat > '.github/workflows/burn_season.yml' << 'VOEFIX3_EOF'
 name: Burn Season (Individual Subs + Confirm-Before-Burn + Matrix Parallel)
 
 on:
@@ -1798,7 +1804,10 @@ jobs:
               raise SystemExit
           code = ''
           if isinstance(d, dict):
-              if isinstance(d.get('files'), list) and d['files']:
+              # Confirmed real shape: a singular {\"file\": {\"file_code\": ...}}
+              if isinstance(d.get('file'), dict):
+                  code = d['file'].get('file_code') or d['file'].get('filecode') or ''
+              if not code and isinstance(d.get('files'), list) and d['files']:
                   f0 = d['files'][0]
                   code = f0.get('file_code') or f0.get('filecode') or ''
               if not code:
@@ -2003,7 +2012,7 @@ jobs:
               || true
           fi
 
-VOEFIX2_EOF
+VOEFIX3_EOF
 echo '  ✓ wrote .github/workflows/burn_season.yml'
 
 echo ""

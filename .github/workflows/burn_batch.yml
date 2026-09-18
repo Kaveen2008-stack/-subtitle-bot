@@ -409,7 +409,20 @@ jobs:
 
           SERVER_RESPONSE=$(curl -s "https://voe.sx/api/upload/server?key=${VOE_API_KEY}")
           echo "VOE upload/server response: $SERVER_RESPONSE"
-          UPLOAD_SERVER=$(echo "$SERVER_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',{}).get('upload_server',''))" 2>/dev/null || echo "")
+          UPLOAD_SERVER=$(echo "$SERVER_RESPONSE" | python3 -c "
+          import sys, json
+          try:
+              d = json.load(sys.stdin)
+          except Exception:
+              print('')
+              raise SystemExit
+          r = d.get('result', '')
+          # Confirmed real shape: result IS the upload URL (a string).
+          # Kept the dict fallback in case VOE ever nests it instead.
+          if isinstance(r, dict):
+              r = r.get('upload_server', '')
+          print(r if isinstance(r, str) else '')
+          " 2>/dev/null || echo "")
 
           if [ -z "$UPLOAD_SERVER" ]; then
             echo "WARNING: could not get a VOE upload server, continuing without VOE link."

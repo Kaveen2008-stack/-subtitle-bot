@@ -14,6 +14,15 @@ def main():
     file_path = sys.argv[1]
     api_key = os.environ.get("PIXELDRAIN_API_KEY", "")
 
+    if not api_key:
+        print(
+            "WARNING: PIXELDRAIN_API_KEY is not set - uploading anonymously. "
+            "Anonymous Pixeldrain files get auto-deleted after a while, which "
+            "is why old download links eventually stop working. Set "
+            "PIXELDRAIN_API_KEY as a GitHub Actions secret to fix this.",
+            file=sys.stderr,
+        )
+
     url = f"https://pixeldrain.com/api/file/{os.path.basename(file_path)}"
     headers = {}
     if api_key:
@@ -31,7 +40,10 @@ def main():
         sys.exit(1)
 
     file_id = data["id"]
-    link = f"https://pixeldrain.com/u/{file_id}"
+    # Direct-download API endpoint (?download) instead of the HTML viewer
+    # page https://pixeldrain.com/u/{id} - so the link actually downloads
+    # the file instead of just opening Pixeldrain's page.
+    link = f"https://pixeldrain.com/api/file/{file_id}?download"
 
     with open("pixeldrain_link.txt", "w") as f:
         f.write(link)

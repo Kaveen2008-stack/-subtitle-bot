@@ -73,7 +73,7 @@ def main():
     parser.add_argument("font_name")
     parser.add_argument("--font-size", type=int, default=42)
     parser.add_argument("--margin-v", type=int, default=14)
-    parser.add_argument("--outline", type=int, default=1)
+    parser.add_argument("--outline", type=float, default=1)
     args = parser.parse_args()
 
     with open(args.input_path, "r", encoding="utf-8-sig", errors="ignore") as f:
@@ -111,7 +111,7 @@ def main():
                 if len(fields) >= 22:
                     fields[1] = f" {args.font_name}"
                     fields[2] = f" {args.font_size}"
-                    fields[16] = f" {args.outline}"
+                    fields[16] = f" {args.outline:g}"
                     fields[21] = f" {args.margin_v}"
                     out_lines.append("Style:" + ",".join(fields))
                     style_count += 1
@@ -161,7 +161,7 @@ def main():
         f.write("\n".join(out_lines) + "\n")
 
     print(f"clean_ass: {style_count} style(s) forced to font '{args.font_name}' "
-          f"(size={args.font_size}, outline={args.outline}, marginv={args.margin_v})")
+          f"(size={args.font_size}, outline={args.outline:g}, marginv={args.margin_v})")
     print(f"clean_ass: removed {removed} credit/ad dialogue line(s), kept {kept}")
 
 

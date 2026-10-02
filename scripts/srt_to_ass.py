@@ -11,7 +11,7 @@ are converted to the equivalent ASS override codes so italics still work.
 
 Usage (backward compatible - old 3-arg calls still work):
     python srt_to_ass.py subs.srt subs.ass "Noto Sans Sinhala"
-    python srt_to_ass.py subs.srt subs.ass "Noto Sans Sinhala" --font-size 64 --margin-v 30 --outline 3
+    python srt_to_ass.py subs.srt subs.ass "Noto Sans Sinhala" --font-size 64 --margin-v 30 --outline 0.6
 """
 import sys
 import re
@@ -124,7 +124,7 @@ def main():
     # settings fetch fails for any reason, output looks the same as before.
     parser.add_argument("--font-size", type=int, default=42)
     parser.add_argument("--margin-v", type=int, default=14)
-    parser.add_argument("--outline", type=int, default=1)
+    parser.add_argument("--outline", type=float, default=1)
     args = parser.parse_args()
 
     cues = parse_srt(args.srt_path)
@@ -136,7 +136,7 @@ PlayResY: 720
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{args.font_name},{args.font_size},&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,{args.outline},0,2,10,10,{args.margin_v},1
+Style: Default,{args.font_name},{args.font_size},&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,{args.outline:g},0,2,10,10,{args.margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -147,7 +147,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         for start, end, text in cues:
             f.write(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}\n")
 
-    print(f"Converted {len(cues)} cues to {args.ass_path} (font={args.font_size}, margin={args.margin_v}, outline={args.outline})")
+    print(f"Converted {len(cues)} cues to {args.ass_path} (font={args.font_size}, margin={args.margin_v}, outline={args.outline:g})")
 
 
 if __name__ == "__main__":

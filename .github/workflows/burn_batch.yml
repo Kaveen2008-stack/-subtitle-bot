@@ -355,6 +355,9 @@ jobs:
         env:
           GDRIVE_SA_JSON_B64: ${{ secrets.GDRIVE_SA_JSON_B64 }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
         run: |
           set -e
           echo "$GDRIVE_SA_JSON_B64" | base64 -d > sa.json
@@ -394,6 +397,7 @@ jobs:
           python3 - <<'PY'
           import os, re, sys
           from internetarchive import upload
+          from urllib.parse import quote
 
           out = os.environ["OUT_NAME"]
           base = re.sub(r"\.mp4$", "", out)
@@ -430,7 +434,7 @@ jobs:
           print("Internet Archive link:", link)
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"link={link}\n")
-              f.write(f"embed=https://archive.org/embed/{ident}\n")
+              f.write(f"direct=https://archive.org/download/{ident}/{quote(out)}\n")
           PY
 
       - name: Save video for later sequential Telegram upload
@@ -529,7 +533,7 @@ jobs:
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
           LINK: ${{ steps.pixeldrain.outputs.link }}
           VOE_LINK: ${{ steps.voe.outputs.link }}
-          ARCHIVE_EMBED: ${{ steps.archive.outputs.embed }}
+          ARCHIVE_DIRECT: ${{ steps.archive.outputs.direct }}
         run: |
           if [ -z "$LINK" ]; then exit 0; fi
           curl -s -X POST "https://onlyksub.vercel.app/api/webhook-hardcode-complete" \
@@ -541,7 +545,7 @@ jobs:
               \"episode_number\": ${{ matrix.episode.episode_number }},
               \"pixeldrain_download_url\": \"${LINK}\",
               \"voe_embed_url\": \"${VOE_LINK}\",
-              \"archive_embed_url\": \"${ARCHIVE_EMBED}\",
+              \"archive_direct_url\": \"${ARCHIVE_DIRECT}\",
               \"quality\": \"${{ matrix.quality }}\"
             }"
 

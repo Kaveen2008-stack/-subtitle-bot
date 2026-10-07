@@ -484,6 +484,7 @@ jobs:
           python3 - <<'PY'
           import os, re, sys
           from internetarchive import upload
+          from urllib.parse import quote
 
           out = os.environ["OUT_NAME"]
           base = re.sub(r"\.mp4$", "", out)
@@ -520,7 +521,7 @@ jobs:
           print("Internet Archive link:", link)
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"link={link}\n")
-              f.write(f"embed=https://archive.org/embed/{ident}\n")
+              f.write(f"direct=https://archive.org/download/{ident}/{quote(out)}\n")
           PY
 
       - name: Save video for later sequential Telegram upload
@@ -625,7 +626,7 @@ jobs:
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
           LINK: ${{ steps.pixeldrain.outputs.link }}
           VOE_LINK: ${{ steps.voe.outputs.link }}
-          ARCHIVE_EMBED: ${{ steps.archive.outputs.embed }}
+          ARCHIVE_DIRECT: ${{ steps.archive.outputs.direct }}
         run: |
           curl -s -X POST "https://onlyksub.vercel.app/api/webhook-hardcode-complete" \
             -H "Content-Type: application/json" \
@@ -636,7 +637,7 @@ jobs:
               \"episode_number\": ${{ matrix.episode.episode_number }},
               \"pixeldrain_download_url\": \"${LINK}\",
               \"voe_embed_url\": \"${VOE_LINK}\",
-              \"archive_embed_url\": \"${ARCHIVE_EMBED}\",
+              \"archive_direct_url\": \"${ARCHIVE_DIRECT}\",
               \"quality\": \"${{ matrix.quality }}\"
             }"
 

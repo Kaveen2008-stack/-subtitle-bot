@@ -377,6 +377,62 @@ jobs:
             exit 1
           fi
 
+      - name: Upload to Internet Archive (backup copy)
+        id: archive
+        continue-on-error: true   # archive.org failing must never break the burn/upload pipeline
+        env:
+          IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
+          IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
+          DRAMA_NAME: ${{ inputs.drama_name }}
+        run: |
+          set -e
+          if [ -z "$IA_ACCESS_KEY" ] || [ -z "$IA_SECRET_KEY" ]; then
+            echo "IA_ACCESS_KEY / IA_SECRET_KEY not set - skipping Internet Archive upload."
+            exit 0
+          fi
+          pip install --quiet internetarchive
+          python3 - <<'PY'
+          import os, re, sys
+          from internetarchive import upload
+
+          out = os.environ["OUT_NAME"]
+          base = re.sub(r"\.mp4$", "", out)
+          # IA identifiers: letters, numbers, _ and - only, must start with alnum
+          ident = ("onlyksub-" + re.sub(r"[^A-Za-z0-9_-]", "", base)).lower()
+
+          md = {
+              "title": base.replace("_", " "),
+              "mediatype": "movies",
+              "creator": "OnlyKSub",
+              "description": f"{os.environ.get('DRAMA_NAME', '')} - Sinhala subtitled ({base}) - onlyksub",
+          }
+          try:
+              res = upload(
+                  ident,
+                  files=[out],
+                  metadata=md,
+                  access_key=os.environ["IA_ACCESS_KEY"],
+                  secret_key=os.environ["IA_SECRET_KEY"],
+                  retries=5,
+                  retries_sleep=30,
+                  verbose=True,
+              )
+              ok = all(r.status_code == 200 for r in res)
+          except Exception as e:
+              print("Internet Archive upload error:", e)
+              ok = False
+
+          if not ok:
+              print("::warning::Internet Archive upload failed")
+              sys.exit(1)
+
+          link = f"https://archive.org/details/{ident}"
+          print("Internet Archive link:", link)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"link={link}\n")
+              f.write(f"embed=https://archive.org/embed/{ident}\n")
+          PY
+
       - name: Save video for later sequential Telegram upload
         # Telegram upload is done OUTSIDE this concurrent matrix job (see the
         # separate upload-telegram job below). Uploading from many parallel
@@ -473,6 +529,7 @@ jobs:
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
           LINK: ${{ steps.pixeldrain.outputs.link }}
           VOE_LINK: ${{ steps.voe.outputs.link }}
+          ARCHIVE_EMBED: ${{ steps.archive.outputs.embed }}
         run: |
           if [ -z "$LINK" ]; then exit 0; fi
           curl -s -X POST "https://onlyksub.vercel.app/api/webhook-hardcode-complete" \
@@ -484,6 +541,7 @@ jobs:
               \"episode_number\": ${{ matrix.episode.episode_number }},
               \"pixeldrain_download_url\": \"${LINK}\",
               \"voe_embed_url\": \"${VOE_LINK}\",
+              \"archive_embed_url\": \"${ARCHIVE_EMBED}\",
               \"quality\": \"${{ matrix.quality }}\"
             }"
 
@@ -641,4 +699,3 @@ jobs:
               -d "{\"status\":\"${FINAL_STATUS}\",\"finished_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"github_run_url\":\"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"}" \
               || true
           fi
-

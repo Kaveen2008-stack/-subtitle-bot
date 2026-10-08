@@ -628,7 +628,8 @@ jobs:
           VOE_LINK: ${{ steps.voe.outputs.link }}
           ARCHIVE_DIRECT: ${{ steps.archive.outputs.direct }}
         run: |
-          curl -s -X POST "https://onlyksub.vercel.app/api/webhook-hardcode-complete" \
+          echo "Archive direct URL for webhook: ${ARCHIVE_DIRECT:-<empty>}"
+          curl -sS -w "\nWebhook HTTP %{http_code}\n" -X POST "https://onlyksub.vercel.app/api/webhook-hardcode-complete" \
             -H "Content-Type: application/json" \
             -H "x-webhook-secret: ${WEBHOOK_SECRET}" \
             -d "{

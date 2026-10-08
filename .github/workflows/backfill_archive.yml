@@ -1,0 +1,48 @@
+name: Backfill Archive servers (one-time)
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "false = dry run (only prints the plan), true = really write to Supabase"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      map_json:
+        description: 'Optional manual map, e.g. {"sold_out_on_you": 287011}  (leave empty normally)'
+        required: false
+        default: ""
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requests
+        run: pip install --quiet requests
+
+      - name: Run backfill
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+          APPLY: ${{ inputs.apply }}
+          MAP_JSON: ${{ inputs.map_json }}
+        run: |
+          set -e
+          ARGS=""
+          if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; fi
+          if [ -n "$MAP_JSON" ]; then
+            printf '%s' "$MAP_JSON" > manual_map.json
+            ARGS="$ARGS --map manual_map.json"
+          fi
+          python scripts/backfill_archive_servers.py $ARGS

@@ -7,11 +7,15 @@ on:
         description: "Archive item id, e.g. onlyksub-alchemy_of_souls_s1e1_720p"
         required: true
         default: "onlyksub-alchemy_of_souls_s1e1_720p"
+      compare_url:
+        description: "Optional: another direct .mp4 URL (e.g. from another site) to compare speed with"
+        required: false
+        default: ""
 
 jobs:
   diagnose:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/setup-python@v5
         with:
@@ -20,9 +24,10 @@ jobs:
       - name: Install requests
         run: pip install --quiet requests
 
-      - name: Inspect item files + download path
+      - name: Inspect item files + speed test
         env:
           IDENT: ${{ inputs.identifier }}
+          COMPARE_URL: ${{ inputs.compare_url }}
         run: |
           python3 - <<'PY'
           import os, time
@@ -30,25 +35,34 @@ jobs:
           import requests
 
           ident = os.environ["IDENT"]
+          compare = os.environ.get("COMPARE_URL", "").strip()
+
           m = requests.get(f"https://archive.org/metadata/{ident}", timeout=60).json()
           print("Item server:", m.get("server"), "| dir:", m.get("dir"))
-          print("\nFILES (source | format | name | size | bitrate):")
-          mp4s = []
+          print("\nFILES (source | format | name | size):")
+          urls = []
           for f in m.get("files", []):
               size_mb = round(int(f.get("size", 0) or 0) / 1e6, 1)
-              print(" ", f.get("source"), "|", f.get("format"), "|", f.get("name"), "|", size_mb, "MB |", f.get("bitrate"))
+              print(" ", f.get("source"), "|", f.get("format"), "|", f.get("name"), "|", size_mb, "MB")
               if f.get("name", "").lower().endswith(".mp4"):
-                  mp4s.append(f)
+                  urls.append(("OUR ITEM", f"https://archive.org/download/{ident}/{quote(f['name'])}"))
+          if compare:
+              urls.append(("COMPARE", compare))
 
-          print("\nDOWNLOAD PATH TEST (first 1 MB of each .mp4):")
-          for f in mp4s:
-              url = f"https://archive.org/download/{ident}/{quote(f['name'])}"
-              t = time.time()
-              r = requests.get(url, headers={"Range": "bytes=0-1048575"}, timeout=120)
-              dt = time.time() - t
-              hops = [h.status_code for h in r.history]
-              print(" ", f["name"])
-              print("    redirects:", hops, "-> final:", r.url)
-              print("    status:", r.status_code, "| 1 MB in", round(dt, 2), "s")
-          print("\n(Note: this runs on a GitHub server, not in Sri Lanka - compare file sizes/names, not exact speed.)")
+          def test(label, url):
+              print(f"\n[{label}] {url}")
+              for i in range(3):
+                  t = time.time()
+                  r = requests.get(url, headers={"Range": "bytes=0-2097151"}, timeout=120)
+                  total = time.time() - t
+                  mb = len(r.content) / 1e6
+                  print(f"  run {i+1}: status {r.status_code} | headers in {r.elapsed.total_seconds():.2f}s"
+                        f" | {mb:.1f} MB in {total:.2f}s ({mb / total:.2f} MB/s)")
+                  if i == 0:
+                      print("  final server:", r.url[:90])
+
+          print("\nSPEED TEST (3 runs x first 2 MB):")
+          for label, url in urls:
+              test(label, url)
+          print("\n(Runs on a GitHub server, not in Sri Lanka - compare OUR vs COMPARE, not absolute numbers.)")
           PY

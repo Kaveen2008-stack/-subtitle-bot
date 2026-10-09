@@ -1,0 +1,54 @@
+name: Archive item diagnose
+
+on:
+  workflow_dispatch:
+    inputs:
+      identifier:
+        description: "Archive item id, e.g. onlyksub-alchemy_of_souls_s1e1_720p"
+        required: true
+        default: "onlyksub-alchemy_of_souls_s1e1_720p"
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requests
+        run: pip install --quiet requests
+
+      - name: Inspect item files + download path
+        env:
+          IDENT: ${{ inputs.identifier }}
+        run: |
+          python3 - <<'PY'
+          import os, time
+          from urllib.parse import quote
+          import requests
+
+          ident = os.environ["IDENT"]
+          m = requests.get(f"https://archive.org/metadata/{ident}", timeout=60).json()
+          print("Item server:", m.get("server"), "| dir:", m.get("dir"))
+          print("\nFILES (source | format | name | size | bitrate):")
+          mp4s = []
+          for f in m.get("files", []):
+              size_mb = round(int(f.get("size", 0) or 0) / 1e6, 1)
+              print(" ", f.get("source"), "|", f.get("format"), "|", f.get("name"), "|", size_mb, "MB |", f.get("bitrate"))
+              if f.get("name", "").lower().endswith(".mp4"):
+                  mp4s.append(f)
+
+          print("\nDOWNLOAD PATH TEST (first 1 MB of each .mp4):")
+          for f in mp4s:
+              url = f"https://archive.org/download/{ident}/{quote(f['name'])}"
+              t = time.time()
+              r = requests.get(url, headers={"Range": "bytes=0-1048575"}, timeout=120)
+              dt = time.time() - t
+              hops = [h.status_code for h in r.history]
+              print(" ", f["name"])
+              print("    redirects:", hops, "-> final:", r.url)
+              print("    status:", r.status_code, "| 1 MB in", round(dt, 2), "s")
+          print("\n(Note: this runs on a GitHub server, not in Sri Lanka - compare file sizes/names, not exact speed.)")
+          PY

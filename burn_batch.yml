@@ -1,0 +1,713 @@
+name: Burn Subtitles Batch (Per-Episode List - Matrix Parallel)
+
+on:
+  workflow_dispatch:
+    inputs:
+      episodes_json:
+        description: 'JSON array: [{"episode_number":1,"video_url":"https://pixeldrain.com/u/xxxx","srt_url":"https://gist..."}, ...]'
+        required: true
+        type: string
+      qualities_json:
+        description: 'JSON array of qualities to render, e.g. ["1080p","720p"]. Defaults to all 3.'
+        required: false
+        type: string
+        default: '["1080p","720p","480p"]'
+      sub_type:
+        description: "english or sinhala"
+        required: true
+        type: string
+      chat_id:
+        description: "Telegram chat_id to notify when done"
+        required: true
+        type: string
+      tmdb_id:
+        description: "TMDB show ID"
+        required: true
+        type: string
+      drama_name:
+        description: "Drama/show name (used to build output filenames + watermark)"
+        required: true
+        type: string
+      season_number:
+        description: "Season number"
+        required: true
+        type: string
+      sub_format:
+        description: "Subtitle format uploaded: srt or ass"
+        required: false
+        type: string
+        default: "srt"
+      job_id:
+        description: "Supabase job UUID (for dashboard tracking)"
+        required: false
+        type: string
+
+concurrency:
+  group: burn-batch-${{ inputs.chat_id }}-${{ inputs.tmdb_id }}-${{ inputs.season_number }}
+  cancel-in-progress: false
+
+jobs:
+  # ============================================================
+  # JOB 1: Runs ONCE. Parses the episode list + selected qualities
+  # so both matrix jobs below can fan out on them. No archive
+  # download/extraction - each episode already has a direct URL.
+  # ============================================================
+  # ============================================================
+  # JOB 1: Parses episodes_json + qualities_json so both matrix
+  # jobs below can fan out on them.
+  # ============================================================
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      episodes: ${{ steps.parse.outputs.episodes }}
+      qualities: ${{ steps.parse.outputs.qualities }}
+      telegram_quality: ${{ steps.parse.outputs.telegram_quality }}
+    steps:
+      - name: Parse episodes_json + qualities_json
+        id: parse
+        env:
+          EPISODES_JSON: ${{ inputs.episodes_json }}
+          QUALITIES_JSON: ${{ inputs.qualities_json }}
+        run: |
+          set -e
+          python3 << 'PYEOF'
+          import json, os
+
+          episodes_raw = os.environ["EPISODES_JSON"]
+          qualities_raw = os.environ["QUALITIES_JSON"]
+
+          episodes = json.loads(episodes_raw)
+          qualities = json.loads(qualities_raw)
+
+          if not isinstance(episodes, list) or len(episodes) == 0:
+              raise SystemExit("episodes_json must be a non-empty JSON array")
+
+          for e in episodes:
+              missing = [k for k in ("episode_number", "video_url", "srt_url") if k not in e]
+              if missing:
+                  raise SystemExit(f"bad entry (missing {missing}): {e}")
+
+          # Telegram only gets ONE quality per episode (to keep concurrent
+          # uploads on the single bot token manageable). Pick the highest
+          # quality actually selected for this run - don't hardcode 1080p,
+          # since some sources only have 720p/480p available.
+          PRIORITY = ["1080p", "720p", "480p"]
+          telegram_quality = next((q for q in PRIORITY if q in qualities), qualities[0] if qualities else "")
+
+          print(f"{len(episodes)} episode(s) planned, qualities={qualities}, telegram_quality={telegram_quality}")
+
+          episodes_out = json.dumps(episodes, separators=(",", ":"))
+          qualities_out = json.dumps(qualities, separators=(",", ":"))
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"episodes={episodes_out}\n")
+              out.write(f"qualities={qualities_out}\n")
+              out.write(f"telegram_quality={telegram_quality}\n")
+          PYEOF
+
+
+  prepare-subs:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        episode: ${{ fromJson(needs.plan.outputs.episodes) }}
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - name: Checkout repo (for scripts)
+        uses: actions/checkout@v4
+
+      - name: Install Sinhala font (Noto Sans Sinhala)
+        run: |
+          set -e
+          pip install --quiet fonttools
+          mkdir -p sinhala-font
+          python scripts/install_sinhala_font.py sinhala-font
+          if ! file sinhala-font/NotoSansSinhala-Bold.ttf | grep -qE "TrueType|OpenType"; then
+            echo "ERROR: Font generation failed or file is not a valid font"
+            exit 1
+          fi
+          echo "SINHALA_FONT_NAME=Noto Sans Sinhala" >> "$GITHUB_ENV"
+          chmod +x scripts/report_status.sh
+
+      - name: Set up Python deps
+        run: pip install --quiet google-generativeai requests
+
+      - name: Download subtitle file for ep${{ matrix.episode.episode_number }}
+        run: |
+          set -e
+          EXT="${{ inputs.sub_format }}"
+          if [ -z "$EXT" ]; then EXT="srt"; fi
+          curl -f -L -o "subs_raw.${EXT}" "${{ matrix.episode.srt_url }}"
+
+      - name: Clean subtitle (strip site credits/font tags)
+        if: inputs.sub_format != 'ass'
+        run: python scripts/clean_srt.py subs_raw.srt subs_cleaned.srt
+
+      - name: Translate to Sinhala (only if needed)
+        if: inputs.sub_type == 'english' && inputs.sub_format != 'ass'
+        env:
+          GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
+          GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
+          GEMINI_API_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
+        run: |
+          ./scripts/report_status.sh "translate_ep${{ matrix.episode.episode_number }}" "started"
+          python scripts/translate.py subs_cleaned.srt subs.srt \
+            && ./scripts/report_status.sh "translate_ep${{ matrix.episode.episode_number }}" "success" \
+            || { ./scripts/report_status.sh "translate_ep${{ matrix.episode.episode_number }}" "failed"; exit 1; }
+
+      - name: Use cleaned sub as-is (already Sinhala)
+        if: inputs.sub_type != 'english' && inputs.sub_format != 'ass'
+        run: cp subs_cleaned.srt subs.srt
+
+      - name: Fetch render settings (uses 1080p row for font/margin/outline)
+        run: |
+          set -e
+          RESULT=$(curl -s "${SUPABASE_URL}/rest/v1/render_settings?quality=eq.1080p&select=*" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}")
+          python3 -c "
+          import json, sys, os
+          try:
+              rows = json.loads(sys.argv[1]); s = rows[0] if rows else {}
+          except Exception:
+              s = {}
+          out = os.environ['GITHUB_ENV']
+          with open(out, 'a') as f:
+              f.write(f\"RENDER_FONT_SIZE={s.get('font_size', 42)}\n\")
+              f.write(f\"RENDER_MARGIN_V={s.get('margin_v', 14)}\n\")
+              f.write(f\"RENDER_OUTLINE={s.get('outline_width', 1)}\n\")
+          " "$RESULT"
+
+      - name: Convert SRT to ASS (fixes Sinhala conjunct shaping in libass)
+        if: inputs.sub_format != 'ass'
+        run: |
+          set -e
+          python scripts/srt_to_ass.py subs.srt subs.ass "$SINHALA_FONT_NAME" \
+            --font-size "$RENDER_FONT_SIZE" --margin-v "$RENDER_MARGIN_V" --outline "$RENDER_OUTLINE"
+
+      - name: Clean uploaded ASS (strip source-site credits, force installed font)
+        if: inputs.sub_format == 'ass'
+        run: |
+          set -e
+          python scripts/clean_ass.py subs_raw.ass subs.ass "$SINHALA_FONT_NAME" \
+            --font-size "$RENDER_FONT_SIZE" --margin-v "$RENDER_MARGIN_V" --outline "$RENDER_OUTLINE"
+
+      - name: Upload subs.ass + font as per-episode shared artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-subs-ep${{ matrix.episode.episode_number }}
+          path: |
+            subs.ass
+            sinhala-font/NotoSansSinhala-Bold.ttf
+          retention-days: 1
+
+  # ============================================================
+  # JOB 3: Matrix over episode x quality (built-in cross product,
+  # true parallel, capped at 10 concurrent runners). Each run
+  # downloads its own episode video + the shared subs.ass for
+  # that episode, crops+burns+encodes+uploads its own file, named
+  # <drama>_S<season>E<episode>_<quality>.mp4 with the drama name
+  # and episode burned into the watermark.
+  # ============================================================
+  burn:
+    needs: [plan, prepare-subs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # NOTE: no telegram-bot-api service here anymore - Telegram upload now
+    # happens in the separate sequential `upload-telegram` job below, to
+    # avoid every parallel (episode x quality) runner hitting the same bot
+    # token at once (Telegram flood control).
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        episode: ${{ fromJson(needs.plan.outputs.episodes) }}
+        quality: ${{ fromJson(needs.plan.outputs.qualities) }}
+        include:
+          - quality: 1080p
+            scale: "1920:-2"
+          - quality: 720p
+            scale: "1280:-2"
+          - quality: 480p
+            scale: "854:-2"
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ inputs.chat_id }}
+      JOB_ID: ${{ inputs.job_id }}
+    steps:
+      - name: Checkout repo (for scripts)
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          chmod +x scripts/report_status.sh
+
+      - name: Set up Python deps
+        run: pip install --quiet google-api-python-client google-auth requests Pillow
+
+      - name: Download prepared subs + font for ep${{ matrix.episode.episode_number }}
+        uses: actions/download-artifact@v4
+        with:
+          name: batch-subs-ep${{ matrix.episode.episode_number }}
+
+      - name: Build sanitized output name (drama_S<season>E<episode>_<quality>)
+        id: name
+        run: |
+          set -e
+          RAW="${{ inputs.drama_name }}_S${{ inputs.season_number }}E${{ matrix.episode.episode_number }}"
+          SAFE=$(echo "$RAW" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+          OUT_NAME="${SAFE}_${{ matrix.quality }}.mp4"
+          echo "OUT_NAME=${OUT_NAME}" >> "$GITHUB_ENV"
+          echo "Output filename will be: ${OUT_NAME}"
+
+      - name: Fetch render settings for ${{ matrix.quality }}
+        run: |
+          set -e
+          RESULT=$(curl -s "${SUPABASE_URL}/rest/v1/render_settings?quality=eq.${{ matrix.quality }}&select=*" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}")
+          python3 -c "
+          import json, sys, os
+          try:
+              rows = json.loads(sys.argv[1]); s = rows[0] if rows else {}
+          except Exception:
+              s = {}
+          out = os.environ['GITHUB_ENV']
+          with open(out, 'a') as f:
+              f.write(f\"RENDER_WATERMARK_TEXT={s.get('watermark_text', 'OnlyKSub')}\n\")
+              f.write(f\"RENDER_WATERMARK_OPACITY={s.get('watermark_opacity', 0.6)}\n\")
+              f.write(f\"RENDER_WATERMARK_FONTSIZE={s.get('watermark_fontsize', 16)}\n\")
+              f.write(f\"RENDER_CRF={s.get('crf', 23)}\n\")
+              f.write(f\"RENDER_AUDIO_BITRATE={s.get('audio_bitrate', '128k')}\n\")
+          " "$RESULT"
+
+      - name: Download episode video (ep${{ matrix.episode.episode_number }}, ${{ matrix.quality }})
+        env:
+          PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+          MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
+          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
+        run: |
+          set -e
+          ./scripts/report_status.sh "download_ep${{ matrix.episode.episode_number }}_${{ matrix.quality }}" "started"
+          if ! python3 scripts/resolve_source.py "${{ matrix.episode.video_url }}" input_video.mp4 --kind video; then
+            REASON=$(cat download_error.txt 2>/dev/null || echo UNKNOWN)
+            ./scripts/report_status.sh "download_ep${{ matrix.episode.episode_number }}_${{ matrix.quality }}" "failed" "{\"reason\":\"$REASON\"}"
+            exit 1
+          fi
+          ./scripts/report_status.sh "download_ep${{ matrix.episode.episode_number }}_${{ matrix.quality }}" "success"
+
+      - name: Detect and remove black bars (robust pixel-based auto-crop)
+        run: |
+          set -e
+          CROP=$(python3 scripts/detect_crop.py input_video.mp4 --threshold 24 --samples 30 | grep "^crop=" || true)
+          if [ -z "$CROP" ]; then
+            echo "CROP_FILTER=" >> "$GITHUB_ENV"
+          else
+            echo "CROP_FILTER=${CROP}," >> "$GITHUB_ENV"
+          fi
+
+      - name: Inject OnlyKsub site credit (start + end)
+        run: |
+          set -e
+          DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 input_video.mp4)
+          python3 scripts/inject_credits.py subs.ass "$DURATION" "Noto Sans Sinhala"
+
+      - name: Burn subtitles + watermark (ep${{ matrix.episode.episode_number }}, ${{ matrix.quality }})
+        run: |
+          set -e
+          ./scripts/report_status.sh "burn_ep${{ matrix.episode.episode_number }}_${{ matrix.quality }}" "started"
+          FONT_DIR=$(pwd)/sinhala-font
+          FONT_PATH="${FONT_DIR}/NotoSansSinhala-Bold.ttf"
+
+          WATERMARK_TEXT=$(echo "$RENDER_WATERMARK_TEXT" | sed "s/'/\\\\'/g" | sed "s/:/\\\\:/g")
+
+          # Streaming-friendly bitrate cap (CRF stays, but peaks are limited) so the file
+          # starts playing fast on slow connections instead of being a huge 1-2 GB file.
+          case "${{ matrix.quality }}" in
+            1080p) MAXRATE_K=4000 ;;
+            720p)  MAXRATE_K=2200 ;;
+            *)     MAXRATE_K=1100 ;;
+          esac
+          FILTER="${CROP_FILTER}ass=subs.ass:fontsdir=${FONT_DIR},scale=${{ matrix.scale }},"
+          FILTER="${FILTER}drawtext=text='${WATERMARK_TEXT}':fontfile=${FONT_PATH}:fontsize=${RENDER_WATERMARK_FONTSIZE}:fontcolor=white@${RENDER_WATERMARK_OPACITY}:borderw=1:bordercolor=black@0.5:x=w-tw-16:y=h-th-16"
+
+          if ! ffmpeg -y -i input_video.mp4 \
+            -vf "$FILTER" \
+            -c:v libx264 -preset veryfast -crf "${RENDER_CRF}" -maxrate "${MAXRATE_K}k" -bufsize "$((MAXRATE_K * 2))k" -pix_fmt yuv420p \
+            -c:a aac -b:a "${RENDER_AUDIO_BITRATE}" \
+            -movflags +faststart \
+            "$OUT_NAME"; then
+            ./scripts/report_status.sh "burn_ep${{ matrix.episode.episode_number }}_${{ matrix.quality }}" "failed"
+            exit 1
+          fi
+          ./scripts/report_status.sh "burn_ep${{ matrix.episode.episode_number }}_${{ matrix.quality }}" "success"
+
+      - name: Upload to Google Drive (1080p only)
+        id: drive
+        if: matrix.quality == needs.plan.outputs.telegram_quality
+        continue-on-error: true
+        env:
+          GDRIVE_SA_JSON_B64: ${{ secrets.GDRIVE_SA_JSON_B64 }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+        run: |
+          set -e
+          echo "$GDRIVE_SA_JSON_B64" | base64 -d > sa.json
+          if GDRIVE_SA_JSON=sa.json python scripts/upload_drive.py "$OUT_NAME"; then
+            echo "link=$(cat drive_link.txt)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload to Pixeldrain
+        id: pixeldrain
+        env:
+          PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+        run: |
+          set -e
+          ./scripts/report_status.sh "upload_ep${{ matrix.episode.episode_number }}_${{ matrix.quality }}" "started"
+          if python scripts/upload_pixeldrain.py "$OUT_NAME"; then
+            echo "link=$(cat pixeldrain_link.txt)" >> "$GITHUB_OUTPUT"
+            ./scripts/report_status.sh "upload_ep${{ matrix.episode.episode_number }}_${{ matrix.quality }}" "success" "{\"link\":\"$(cat pixeldrain_link.txt)\"}"
+          else
+            ./scripts/report_status.sh "upload_ep${{ matrix.episode.episode_number }}_${{ matrix.quality }}" "failed"
+            exit 1
+          fi
+
+      - name: Upload to Internet Archive (backup copy)
+        id: archive
+        continue-on-error: true   # archive.org failing must never break the burn/upload pipeline
+        env:
+          IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
+          IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
+          DRAMA_NAME: ${{ inputs.drama_name }}
+        run: |
+          set -e
+          if [ -z "$IA_ACCESS_KEY" ] || [ -z "$IA_SECRET_KEY" ]; then
+            echo "IA_ACCESS_KEY / IA_SECRET_KEY not set - skipping Internet Archive upload."
+            exit 0
+          fi
+          pip install --quiet internetarchive
+          python3 - <<'PY'
+          import os, re, sys
+          from internetarchive import upload
+          from urllib.parse import quote
+
+          out = os.environ["OUT_NAME"]
+          base = re.sub(r"\.mp4$", "", out)
+          # IA identifiers: letters, numbers, _ and - only, must start with alnum
+          ident = ("onlyksub-" + re.sub(r"[^A-Za-z0-9_-]", "", base)).lower()
+
+          md = {
+              "title": base.replace("_", " "),
+              "mediatype": "movies",
+              "creator": "OnlyKSub",
+              "description": f"{os.environ.get('DRAMA_NAME', '')} - Sinhala subtitled ({base}) - onlyksub",
+          }
+          try:
+              res = upload(
+                  ident,
+                  files=[out],
+                  metadata=md,
+                  access_key=os.environ["IA_ACCESS_KEY"],
+                  secret_key=os.environ["IA_SECRET_KEY"],
+                  retries=5,
+                  retries_sleep=30,
+                  verbose=True,
+              )
+              ok = all(r.status_code == 200 for r in res)
+          except Exception as e:
+              print("Internet Archive upload error:", e)
+              ok = False
+
+          if not ok:
+              print("::warning::Internet Archive upload failed")
+              sys.exit(1)
+
+          link = f"https://archive.org/details/{ident}"
+          print("Internet Archive link:", link)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"link={link}\n")
+              f.write(f"direct=https://archive.org/download/{ident}/{quote(out)}\n")
+          PY
+
+      - name: Save video for later sequential Telegram upload
+        # Telegram upload is done OUTSIDE this concurrent matrix job (see the
+        # separate upload-telegram job below). Uploading from many parallel
+        # matrix runners (one per episode/quality) on the SAME bot token at
+        # once triggers Telegram's flood control (retry_after can be 3000+
+        # seconds) since it looks like abuse from Telegram's side.
+        # Sequential, one-at-a-time uploads after all burns finish avoids
+        # that entirely. All qualities now upload (previously 1080p-only),
+        # so the artifact is keyed by episode AND quality.
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-pending-ep${{ matrix.episode.episode_number }}-${{ matrix.quality }}
+          path: ${{ env.OUT_NAME }}
+          retention-days: 1
+
+      - name: Upload to VOE.sx (1080p only, direct file upload)
+        id: voe
+        if: matrix.quality == needs.plan.outputs.telegram_quality
+        continue-on-error: true
+        env:
+          VOE_API_KEY: ${{ secrets.VOE_API_KEY }}
+        run: |
+          # Was: ask VOE to fetch the file itself from a Pixeldrain URL
+          # (upload/url). Pixeldrain blocks/CAPTCHA-walls fetches coming
+          # from VOE's servers (datacenter IP), so VOE downloaded a CAPTCHA
+          # or error page instead of the video ("Not a video file") no
+          # matter which Pixeldrain URL shape was used. Fix: skip the
+          # remote-fetch step entirely and POST the video file we already
+          # have on this runner straight to VOE.
+
+          SERVER_RESPONSE=$(curl -s "https://voe.sx/api/upload/server?key=${VOE_API_KEY}")
+          echo "VOE upload/server response: $SERVER_RESPONSE"
+          UPLOAD_SERVER=$(echo "$SERVER_RESPONSE" | python3 -c "
+          import sys, json
+          try:
+              d = json.load(sys.stdin)
+          except Exception:
+              print('')
+              raise SystemExit
+          r = d.get('result', '')
+          # Confirmed real shape: result IS the upload URL (a string).
+          # Kept the dict fallback in case VOE ever nests it instead.
+          if isinstance(r, dict):
+              r = r.get('upload_server', '')
+          print(r if isinstance(r, str) else '')
+          " 2>/dev/null || echo "")
+
+          if [ -z "$UPLOAD_SERVER" ]; then
+            echo "WARNING: could not get a VOE upload server, continuing without VOE link."
+            exit 0
+          fi
+          echo "VOE upload server: $UPLOAD_SERVER"
+
+          UPLOAD_RESPONSE=$(curl -s -F "key=${VOE_API_KEY}" -F "file=@${OUT_NAME}" "$UPLOAD_SERVER")
+          echo "VOE direct upload response: $UPLOAD_RESPONSE"
+
+          # Response shape for the direct-upload endpoint isn't fully
+          # documented publicly, so try every plausible path this family
+          # of file-host APIs (VOE/StreamHG/Doodstream-style clones) uses,
+          # instead of assuming one and breaking silently if it's wrong.
+          FILE_CODE=$(echo "$UPLOAD_RESPONSE" | python3 -c "
+          import sys, json
+          try:
+              d = json.load(sys.stdin)
+          except Exception:
+              print('')
+              raise SystemExit
+          code = ''
+          if isinstance(d, dict):
+              # Confirmed real shape: a singular {\"file\": {\"file_code\": ...}}
+              if isinstance(d.get('file'), dict):
+                  code = d['file'].get('file_code') or d['file'].get('filecode') or ''
+              if not code and isinstance(d.get('files'), list) and d['files']:
+                  f0 = d['files'][0]
+                  code = f0.get('file_code') or f0.get('filecode') or ''
+              if not code:
+                  code = d.get('file_code') or d.get('filecode') or ''
+              if not code and isinstance(d.get('result'), dict):
+                  code = d['result'].get('file_code') or d['result'].get('filecode') or ''
+          print(code)
+          " 2>/dev/null || echo "")
+
+          if [ -n "$FILE_CODE" ]; then
+            echo "link=https://voe.sx/e/${FILE_CODE}" >> "$GITHUB_OUTPUT"
+            echo "VOE embed link ready: https://voe.sx/e/${FILE_CODE}"
+          else
+            echo "WARNING: VOE direct upload response had no recognizable file_code - see the raw response logged above, continuing without VOE link."
+          fi
+
+      - name: Notify website (webhook) for ep${{ matrix.episode.episode_number }} ${{ matrix.quality }}
+        if: always()
+        continue-on-error: true
+        env:
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          LINK: ${{ steps.pixeldrain.outputs.link }}
+          VOE_LINK: ${{ steps.voe.outputs.link }}
+          ARCHIVE_DIRECT: ${{ steps.archive.outputs.direct }}
+        run: |
+          if [ -z "$LINK" ]; then exit 0; fi
+          echo "Archive direct URL for webhook: ${ARCHIVE_DIRECT:-<empty>}"
+          curl -sS -w "\nWebhook HTTP %{http_code}\n" -X POST "https://onlyksub.vercel.app/api/webhook-hardcode-complete" \
+            -H "Content-Type: application/json" \
+            -H "x-webhook-secret: ${WEBHOOK_SECRET}" \
+            -d "{
+              \"tmdb_id\": ${{ inputs.tmdb_id }},
+              \"season_number\": ${{ inputs.season_number }},
+              \"episode_number\": ${{ matrix.episode.episode_number }},
+              \"pixeldrain_download_url\": \"${LINK}\",
+              \"voe_embed_url\": \"${VOE_LINK}\",
+              \"archive_direct_url\": \"${ARCHIVE_DIRECT}\",
+              \"quality\": \"${{ matrix.quality }}\"
+            }"
+
+      - name: Notify on Telegram for ep${{ matrix.episode.episode_number }} ${{ matrix.quality }}
+        if: always()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ inputs.chat_id }}
+          LINK: ${{ steps.pixeldrain.outputs.link }}
+          VOE_LINK: ${{ steps.voe.outputs.link }}
+        run: |
+          if [ -n "$LINK" ]; then
+            TEXT="✅ ${{ inputs.drama_name }} S${{ inputs.season_number }}E${{ matrix.episode.episode_number }} (${{ matrix.quality }}) done! 📥 ${LINK}"
+            if [ -n "$VOE_LINK" ]; then
+              TEXT="${TEXT}"$'\n'"🎬 VOE: ${VOE_LINK}"
+            fi
+          else
+            TEXT="❌ ${{ inputs.drama_name }} S${{ inputs.season_number }}E${{ matrix.episode.episode_number }} (${{ matrix.quality }}) failed. Check the GitHub Actions log."
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            --data-urlencode text="${TEXT}"
+
+      - name: Upload artifact (backup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-burned-ep${{ matrix.episode.episode_number }}-${{ matrix.quality }}
+          path: ${{ env.OUT_NAME }}
+          retention-days: 3
+
+  # ============================================================
+  # JOB 3.5: Uploads every episode's best-quality video to Telegram
+  # ONE AT A TIME, on a single runner - not a matrix. Doing this
+  # concurrently (many matrix legs sharing one bot token) triggers
+  # Telegram's flood control, which can impose a multi-thousand-
+  # second penalty on the whole bot. Sequential uploads with a
+  # short delay between each avoids that entirely.
+  # ============================================================
+  upload-telegram:
+    needs: [plan, burn]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    services:
+      telegram-bot-api:
+        image: aiogram/telegram-bot-api:latest
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        ports:
+          - 8081:8081
+    steps:
+      - name: Checkout repo (for scripts)
+        uses: actions/checkout@v4
+
+      - name: Set up Python deps
+        run: pip install --quiet requests
+
+      - name: Wait for local Telegram Bot API server
+        run: |
+          for i in $(seq 1 30); do
+            if curl -s -o /dev/null "http://localhost:8081"; then
+              echo "Local Bot API server is up."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "WARNING: local Bot API server did not come up in time."
+
+      - name: Upload each episode/quality video sequentially
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          EPISODES_JSON: ${{ needs.plan.outputs.episodes }}
+          QUALITIES_JSON: ${{ needs.plan.outputs.qualities }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          TMDB_ID: ${{ inputs.tmdb_id }}
+          SEASON_NUMBER: ${{ inputs.season_number }}
+        run: |
+          set +e  # one episode/quality's failure shouldn't stop the rest
+          echo "$EPISODES_JSON" > episodes.json
+          EPISODES=$(python3 -c "import json; print(' '.join(str(e['episode_number']) for e in json.load(open('episodes.json'))))")
+          QUALITIES=$(python3 -c "import json,os; print(' '.join(json.loads(os.environ['QUALITIES_JSON'])))")
+
+          for EP in $EPISODES; do
+            for QUALITY in $QUALITIES; do
+              echo "=== Episode $EP ($QUALITY) ==="
+              ARTIFACT_NAME="telegram-pending-ep${EP}-${QUALITY}"
+              rm -rf dl && mkdir dl
+              if ! gh run download "${{ github.run_id }}" --name "$ARTIFACT_NAME" --dir dl 2>/dev/null; then
+                echo "No artifact found for episode $EP $QUALITY (burn may have failed) - skipping."
+                continue
+              fi
+              # The artifact contains exactly one properly-named video file
+              # (drama_S<season>E<episode>_<quality>.mp4) - find it instead of
+              # assuming a hardcoded filename.
+              VIDEO_FILE=$(find dl -maxdepth 1 -type f -iname "*.mp4" | head -1)
+              if [ -z "$VIDEO_FILE" ]; then
+                echo "WARNING: no video file found in artifact for episode $EP $QUALITY - skipping."
+                continue
+              fi
+              rm -f telegram_message_id.txt telegram_chat_id.txt
+              CAPTION="${{ inputs.drama_name }} S${{ inputs.season_number }}E${EP} (${QUALITY}) - OnlyKsub"
+              if python scripts/upload_telegram_local.py "$VIDEO_FILE" "$CAPTION"; then
+                echo "Episode $EP ($QUALITY) uploaded: $(cat telegram_link.txt)"
+                if [ -f telegram_message_id.txt ]; then
+                  MSG_ID=$(cat telegram_message_id.txt)
+                  CHAT_ID=$(cat telegram_chat_id.txt)
+                  curl -s -f -X POST "https://onlyksub.vercel.app/api/webhook-telegram-uploaded" \
+                    -H "Content-Type: application/json" \
+                    -H "x-webhook-secret: ${WEBHOOK_SECRET}" \
+                    -d "{
+                      \"tmdb_id\": ${TMDB_ID},
+                      \"season_number\": ${SEASON_NUMBER},
+                      \"episode_number\": ${EP},
+                      \"quality\": \"${QUALITY}\",
+                      \"telegram_chat_id\": \"${CHAT_ID}\",
+                      \"telegram_message_id\": ${MSG_ID}
+                    }" \
+                    && echo "Notified website for episode $EP $QUALITY (chat_id=${CHAT_ID}, message_id=${MSG_ID})." \
+                    || echo "::warning::Failed to notify website about episode $EP $QUALITY's Telegram upload."
+                fi
+              else
+                echo "::warning::Episode $EP $QUALITY Telegram upload failed - the site will NOT show a Telegram download link for this quality."
+              fi
+              echo "Waiting 15s before next upload (flood control safety margin)..."
+              sleep 15
+            done
+          done
+
+  # ============================================================
+  # JOB 4: Runs once ALL episode x quality burns (+ Telegram
+  # uploads) finish. Marks the Supabase job row as done.
+  # ============================================================
+  finalize:
+    needs: [burn, upload-telegram]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark job done in dashboard
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          if [ -n "$SUPABASE_URL" ] && [ -n "$JOB_ID" ]; then
+            FINAL_STATUS="done"
+            if [ "${{ needs.burn.result }}" != "success" ]; then FINAL_STATUS="failed"; fi
+            curl -s -o /dev/null -X PATCH "${SUPABASE_URL}/rest/v1/jobs?id=eq.${JOB_ID}" \
+              -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+              -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+              -H "Content-Type: application/json" \
+              -d "{\"status\":\"${FINAL_STATUS}\",\"finished_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"github_run_url\":\"${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"}" \
+              || true
+          fi

@@ -24,15 +24,19 @@ TARGET_CALLS = 3          # aim for this many API calls per episode - batch size
                            # tested-safe range; 350+ caused missing blocks in testing)
 MIN_BATCH_SIZE = 60
 MAX_BATCH_SIZE = 300
-# FIX: "gemini-3.5-flash" is NOT a real Gemini model id - every API call
-# failed with a 404, all keys rotated out, and main() then silently wrote
-# the ORIGINAL ENGLISH text to the output file. Episodes marked "sinhala"
-# were being burned with English subs. These are the real ids, tried in
-# order until one of them actually works on the current key.
+# Model ids are tried in order until one works on the current key.
+# History: gemini-2.0-flash was shut down on 1 Jun 2026, and the 2.5 / 1.5
+# models are no longer served to keys that have not used them before (the
+# API answers 404), so the old list failed every run. Per Google's
+# deprecations page (checked Nov 2026): gemini-3.8-flash is the newest Flash
+# model, 3.6-flash is the previous one, and the 3.5-flash id is routed to
+# 3.6-flash. Flash-Lite stays out on purpose (it produced wrong-script glitch
+# characters in Sinhala output). If none of these work, resolve_working_model()
+# asks the API which Flash models exist, so future retirements self-heal.
 MODEL_CANDIDATES = [
-    "gemini-2.0-flash",
-    "gemini-2.5-flash",
-    "gemini-1.5-flash",
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
 ]
 MODEL_NAME = MODEL_CANDIDATES[0]
 MAX_RETRIES_PER_KEY = 2   # retries on the SAME key before rotating to the next one
@@ -160,6 +164,19 @@ def translate_chunk(model, blocks_chunk):
     return [b.strip() for b in result_blocks if b.strip()]
 
 
+# Tokens that mark non-text / cheaper variants we do not want for translation.
+_EXCLUDED_MODEL_TOKENS = ("lite", "image", "tts", "live", "audio", "embedding", "omni", "robotics")
+
+
+def _model_sort_key(name):
+    """Stable models first, then newest version first (3.8 before 3.6 before 3)."""
+    m = re.search(r"gemini-(\d+(?:\.\d+)*)-flash", name)
+    ver = [int(x) for x in m.group(1).split(".")] if m else [0]
+    ver = (ver + [0, 0, 0])[:3]
+    unstable = ("preview" in name) or ("exp" in name)
+    return (unstable, tuple(-v for v in ver), name)
+
+
 class KeyRotator:
     """Holds a list of API keys and hands out a configured genai model,
     rotating to the next key whenever the current one is rate-limited
@@ -177,26 +194,62 @@ class KeyRotator:
         self._genai.configure(api_key=self.api_keys[self.current_idx])
         self.model = self._genai.GenerativeModel(self.model_name)
 
+    def _discover_flash_models(self):
+        """Ask the API which Flash text models this key can call, newest first."""
+        try:
+            found = set()
+            for m in self._genai.list_models():
+                name = (getattr(m, "name", "") or "").replace("models/", "")
+                methods = getattr(m, "supported_generation_methods", None) or []
+                if "generateContent" not in methods:
+                    continue
+                if not re.match(r"^gemini-\d", name) or "flash" not in name:
+                    continue
+                if any(tok in name for tok in _EXCLUDED_MODEL_TOKENS):
+                    continue
+                found.add(name)
+            return sorted(found, key=_model_sort_key)
+        except Exception as e:
+            print(f"  Could not list models from the API ({e})", file=sys.stderr)
+            return []
+
     def resolve_working_model(self, candidates):
         """Probe the candidate model ids with a 1-token request and keep the
-        first one that actually responds. Without this, a wrong/retired
-        model id silently degrades into 'no translation at all' (the bug
-        this replaces). Fails LOUDLY if none work, so the workflow stops
-        instead of burning English subs labelled as Sinhala."""
+        first one that actually responds. If none of the fixed candidates
+        work (Google retires models regularly), ask the API for the Flash
+        models that exist right now and try those. Without a working model a
+        silent fallback would burn English subs labelled as Sinhala, so this
+        still fails LOUDLY if nothing works, and the workflow stops."""
         last_err = None
-        for name in candidates:
+        tried = []
+
+        def attempt(name):
+            nonlocal last_err
+            tried.append(name)
             try:
                 probe = self._genai.GenerativeModel(name)
                 probe.generate_content("ping", request_options={"timeout": 60})
                 self.model_name = name
                 self.model = probe
                 print(f"Using Gemini model: {name}", file=sys.stderr)
-                return name
+                return True
             except Exception as e:
                 last_err = e
                 print(f"  Model '{name}' unavailable ({e}), trying next...", file=sys.stderr)
+                return False
+
+        for name in candidates:
+            if attempt(name):
+                return name
+
+        print("  None of the listed models worked; asking the API which Flash "
+              "models are available...", file=sys.stderr)
+        for name in self._discover_flash_models():
+            if name not in tried and attempt(name):
+                return name
+
         raise RuntimeError(
-            f"None of the Gemini models {candidates} are usable with the provided "
+            f"None of the Gemini models {tried} are usable with the provided "
             f"API key(s). Last error: {last_err}"
         )
 
